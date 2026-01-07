@@ -98,9 +98,10 @@ The NTP Delta Monitor can be configured using an optional `ntp_monitor.ini` conf
    fallback_servers = ntp1.company.com,ntp2.company.com
    
    [report_settings]
-   default_format = seconds
+   default_format = milliseconds
    default_parallel_limit = 10
    default_timeout = 30
+   output_directory = .\Reports
    
    [advanced_settings]
    sort_by_variance = true
@@ -118,9 +119,10 @@ The NTP Delta Monitor can be configured using an optional `ntp_monitor.ini` conf
 | `ntp_settings` | `default_reference_server` | Reference NTP server for baseline comparison | `ntp1.tgna.tegna.com` |
 | `ntp_settings` | `default_discovery_domain` | Domain for auto-discovery of NTP servers | `tgna.tegna.com` |
 | `ntp_settings` | `fallback_servers` | Comma-separated list of fallback servers | TEGNA servers |
-| `report_settings` | `default_format` | Delta format: `seconds` or `milliseconds` | `seconds` |
+| `report_settings` | `default_format` | Delta format: `seconds` or `milliseconds` | `milliseconds` |
 | `report_settings` | `default_parallel_limit` | Concurrent queries (1-100) | `10` |
 | `report_settings` | `default_timeout` | Query timeout in seconds (1-300) | `30` |
+| `report_settings` | `output_directory` | Directory for reports and logs | `.\Reports` |
 | `advanced_settings` | `sort_by_variance` | Sort results by time variance | `true` |
 
 ### Email Configuration
@@ -269,10 +271,10 @@ time.windows.com,external,microsoft,4
 
 ## Output Format
 
-The program generates two output files for each monitoring run:
+The program generates two output files for each monitoring run, saved to the configured output directory (default: `.\Reports`):
 
 ### 1. XLSX Report
-A detailed spreadsheet with comprehensive NTP monitoring data, sorted by variance from zero (highest time drift first).
+A detailed spreadsheet with comprehensive NTP monitoring data. **Error servers are automatically placed at the top of the list** for immediate attention, followed by successful servers sorted by variance from zero (highest time drift first).
 
 ### 2. Summary Text File
 A concise summary file with the same name as the XLSX file but with a `.txt` extension, containing:
@@ -282,8 +284,19 @@ A concise summary file with the same name as the XLSX file but with a `.txt` ext
 - Time delta statistics (min/max/average)
 
 **Example output files**:
-- `ntp_monitor_report_20241230_103000.xlsx` - Detailed XLSX report
-- `ntp_monitor_report_20241230_103000.txt` - Summary text file
+- `Reports\ntp_monitor_report_20241230_103000.xlsx` - Detailed XLSX report
+- `Reports\ntp_monitor_report_20241230_103000.txt` - Summary text file
+
+### Report Sorting Priority
+
+The XLSX report uses intelligent sorting to prioritize problem servers:
+
+1. **Error Servers First**: Servers with ERROR, TIMEOUT, UNSYNCHRONIZED, or UNREACHABLE status appear at the top
+2. **Error Severity**: Error servers are sorted by severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE)  
+3. **Variance Sorting**: Successful servers are sorted by highest absolute time variance
+4. **No Delta Last**: Servers without delta calculations appear at the bottom
+
+This ensures that problematic servers requiring immediate attention are always visible at the top of the report.
 
 ### XLSX Report Columns
 

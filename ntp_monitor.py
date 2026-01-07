@@ -27,6 +27,7 @@ from typing import Optional, List
 import statistics
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 
 class NTPStatus(Enum):
@@ -896,6 +897,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
         'default_format': 'seconds',
         'default_parallel_limit': 10,
         'default_timeout': 30,
+        'output_directory': '.\\Reports',
         'sort_by_variance': True,
         'max_variance_display': 100,
         # Email settings
@@ -907,7 +909,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
         'smtp_password': '',
         'from_email': 'ntp-monitor@tgna.tegna.com',
         'to_email': 'moldham@tegna.com',
-        'error_threshold_seconds': 0.2
+        'variance_threshold_ms': 33
     }
     
     config = configparser.ConfigParser()
@@ -933,6 +935,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
                 defaults['default_format'] = report_section.get('default_format', defaults['default_format'])
                 defaults['default_parallel_limit'] = report_section.getint('default_parallel_limit', defaults['default_parallel_limit'])
                 defaults['default_timeout'] = report_section.getint('default_timeout', defaults['default_timeout'])
+                defaults['output_directory'] = report_section.get('output_directory', defaults['output_directory'])
             
             if 'advanced_settings' in config:
                 advanced_section = config['advanced_settings']
@@ -949,7 +952,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
                 defaults['smtp_password'] = email_section.get('smtp_password', defaults['smtp_password'])
                 defaults['from_email'] = email_section.get('from_email', defaults['from_email'])
                 defaults['to_email'] = email_section.get('to_email', defaults['to_email'])
-                defaults['error_threshold_seconds'] = email_section.getfloat('error_threshold_seconds', defaults['error_threshold_seconds'])
+                defaults['variance_threshold_ms'] = email_section.getfloat('variance_threshold_ms', defaults['variance_threshold_ms'])
                 
         else:
             logger.debug(f"Configuration file {config_file} not found, using defaults")
@@ -1118,7 +1121,7 @@ Default Behavior:
     parser.add_argument(
         '--version',
         action='version',
-        version='NTP Delta Monitor 1.0.0'
+        version='NTP Delta Monitor 2.2.0'
     )
     
     args = parser.parse_args()
@@ -1247,37 +1250,51 @@ def generate_default_filename() -> str:
 def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = True) -> List[NTPResult]:
     """
     Sort NTP results by variance from zero (highest to lowest absolute delta values).
+    Error servers are placed at the top of the list for immediate attention.
     
     Args:
         results: List of NTPResult objects to sort
         sort_by_variance: Whether to sort by variance (True) or keep original order (False)
         
     Returns:
-        Sorted list of NTPResult objects
+        Sorted list of NTPResult objects with error servers first
     """
     if not sort_by_variance:
         return results
     
     logger = logging.getLogger(__name__)
-    logger.debug("Sorting results by variance from zero (highest to lowest absolute delta)")
+    logger.debug("Sorting results with error servers first, then by variance from zero")
     
-    # Separate results with and without delta values
+    # Separate results by status: errors first, then successful with/without delta
+    error_results = []
     results_with_delta = []
     results_without_delta = []
     
     for result in results:
-        if result.delta_seconds is not None:
+        # Put error servers at the top of the list
+        if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED, NTPStatus.UNREACHABLE]:
+            error_results.append(result)
+        elif result.delta_seconds is not None:
             results_with_delta.append(result)
         else:
             results_without_delta.append(result)
     
-    # Sort results with delta by absolute value (highest variance first)
+    # Sort error results by status severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE)
+    status_priority = {
+        NTPStatus.ERROR: 1,
+        NTPStatus.TIMEOUT: 2, 
+        NTPStatus.UNSYNCHRONIZED: 3,
+        NTPStatus.UNREACHABLE: 4
+    }
+    error_results.sort(key=lambda x: status_priority.get(x.status, 5))
+    
+    # Sort successful results with delta by absolute value (highest variance first)
     results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
     
-    # Combine sorted results with delta first, then results without delta
-    sorted_results = results_with_delta + results_without_delta
+    # Combine: error servers first, then sorted successful results, then results without delta
+    sorted_results = error_results + results_with_delta + results_without_delta
     
-    logger.debug(f"Sorted {len(results_with_delta)} results by variance, {len(results_without_delta)} results without delta appended")
+    logger.debug(f"Sorted {len(error_results)} error servers first, {len(results_with_delta)} results by variance, {len(results_without_delta)} results without delta appended")
     
     return sorted_results
 
@@ -1387,16 +1404,84 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
             worksheet.column_dimensions[column_letter].width = adjusted_width
         
-        # Add conditional formatting for status column
+        # Apply status column and variance highlighting - DIRECT APPROACH ONLY
         status_col = 12  # Status column is now the 12th column (after removing Hostname)
+        delta_col = 10   # Delta Value column
+        variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
+        
+        logger.debug(f"Applying Excel DIRECT formatting with variance threshold: {variance_threshold_ms}ms")
+        highlighted_count = 0
+        
+        # Apply DIRECT cell formatting only (most reliable approach)
         for row_num in range(2, len(sorted_results) + 2):
-            cell = worksheet.cell(row=row_num, column=status_col)
-            if cell.value == 'OK':
-                cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            elif cell.value in ['ERROR', 'TIMEOUT', 'UNSYNCHRONIZED']:
-                cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            elif cell.value == 'UNREACHABLE':
-                cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+            # Status column direct formatting
+            status_cell = worksheet.cell(row=row_num, column=status_col)
+            if status_cell.value == 'OK':
+                status_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                status_cell.font = Font(bold=True)
+            elif status_cell.value in ['ERROR', 'TIMEOUT', 'UNSYNCHRONIZED']:
+                status_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                status_cell.font = Font(bold=True)
+            elif status_cell.value == 'UNREACHABLE':
+                status_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+                status_cell.font = Font(bold=True)
+            
+            # Delta Value column variance highlighting - DIRECT FORMATTING ONLY
+            delta_cell = worksheet.cell(row=row_num, column=delta_col)
+            if delta_cell.value and isinstance(delta_cell.value, (int, float)):
+                delta_value = abs(float(delta_cell.value))
+                if delta_value > variance_threshold_ms:
+                    try:
+                        # Apply VERY STRONG direct formatting that should work everywhere
+                        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                        white_font = Font(color="FFFFFF", bold=True, size=12)
+                        delta_cell.fill = red_fill
+                        delta_cell.font = white_font
+                        
+                        # Force the cell to be treated as formatted
+                        delta_cell.number_format = '0'  # Ensure it's treated as a number
+                        
+                        highlighted_count += 1
+                        logger.info(f"Row {row_num}: DIRECT formatting applied to {delta_value}ms (exceeds {variance_threshold_ms}ms) - Cell: {delta_cell.coordinate}")
+                    except Exception as e:
+                        logger.error(f"Failed to apply direct formatting to row {row_num}: {e}")
+                else:
+                    # Apply normal formatting to non-highlighted cells
+                    delta_cell.font = Font(bold=False)
+                    logger.debug(f"Row {row_num}: Normal formatting {delta_value}ms (within {variance_threshold_ms}ms)")
+        
+        logger.info(f"Applied DIRECT formatting to {highlighted_count} cells exceeding {variance_threshold_ms}ms threshold")
+        
+        # Force save with specific Excel format
+        try:
+            # Save as Excel 2010 format (.xlsx) with explicit formatting preservation
+            workbook.save(output_path)
+            logger.info(f"Saved Excel file with direct formatting: {output_path}")
+            
+            # Verify the file was saved correctly by reopening it
+            from openpyxl import load_workbook
+            test_wb = load_workbook(output_path)
+            test_ws = test_wb.active
+            
+            # Check a few cells to verify formatting was preserved
+            verification_count = 0
+            for row_num in range(2, min(10, len(sorted_results) + 2)):  # Check first 8 rows
+                delta_cell = test_ws.cell(row=row_num, column=delta_col)
+                if delta_cell.fill and delta_cell.fill.start_color:
+                    color = delta_cell.fill.start_color.rgb if hasattr(delta_cell.fill.start_color, 'rgb') else str(delta_cell.fill.start_color)
+                    logger.debug(f"Row {row_num}: Cell color = {color}")
+                    # Check for red color in various formats
+                    if 'FF0000' in str(color) or 'ff0000' in str(color).lower():
+                        verification_count += 1
+                        logger.info(f"Row {row_num}: Verified red formatting - color = {color}")
+            
+            logger.info(f"Verification: Found {verification_count} cells with red formatting in saved file")
+            test_wb.close()
+            
+        except Exception as e:
+            logger.error(f"Error during save/verification: {e}")
+            # Still try to save the file even if verification fails
+            workbook.save(output_path)
         
         # Save the workbook
         workbook.save(output_path)
@@ -1408,16 +1493,18 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
         raise Exception(f"XLSX write error: {e}")
 
 
-def get_output_file_path(config: Config) -> Path:
+def get_output_file_path(config: Config, ini_config: dict) -> Path:
     """
     Determine output file path based on configuration.
     
     Implements filename generation as required by:
     - Requirements 5.2: Generate default filename with UTC timestamp pattern when not specified
     - Requirements 5.5: Handle custom output path specification
+    - Uses configurable output directory from INI settings
     
     Args:
         config: Configuration object with output_file setting
+        ini_config: INI configuration with output_directory setting
         
     Returns:
         Path object for output XLSX file
@@ -1426,9 +1513,17 @@ def get_output_file_path(config: Config) -> Path:
         # Use custom output path specification
         return config.output_file
     else:
+        # Get output directory from configuration
+        output_dir = Path(ini_config.get('output_directory', '.\\Reports'))
+        
+        # Create output directory if it doesn't exist
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
         # Generate default filename with UTC timestamp pattern (XLSX format)
         default_filename = generate_default_filename().replace('.csv', '.xlsx')
-        return Path(default_filename)
+        
+        # Combine directory and filename
+        return output_dir / default_filename
 
 
 def calculate_statistics(results: List[NTPResult]) -> SummaryStats:
@@ -1505,13 +1600,15 @@ def calculate_statistics(results: List[NTPResult]) -> SummaryStats:
     )
 
 
-def format_summary(stats: SummaryStats, config: Config) -> str:
+def format_summary(stats: SummaryStats, config: Config, ini_config: dict, results: List[NTPResult]) -> str:
     """
     Generate end-of-run summary text with statistics.
     
     Args:
         stats: SummaryStats object with calculated statistics
         config: Configuration object with format settings
+        ini_config: INI configuration with threshold settings
+        results: List of NTPResult objects for threshold analysis
         
     Returns:
         Formatted summary string for display
@@ -1533,6 +1630,30 @@ def format_summary(stats: SummaryStats, config: Config) -> str:
         for status_name, count in stats.status_counts.items():
             if count > 0:
                 summary_lines.append(f"  {status_name}: {count}")
+    
+    # Variance threshold analysis
+    variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
+    exceeding_count = 0
+    
+    # Count servers exceeding variance threshold (exclude reference server)
+    reference_server = config.reference_ntp
+    for result in results:
+        # Exclude reference server from threshold counting
+        if (result.status == NTPStatus.OK and 
+            result.delta_seconds is not None and 
+            result.ntp_server != reference_server):
+            # Use same rounding logic as Excel formatting for consistency
+            delta_ms = int(round(abs(result.delta_seconds) * 1000))  # Convert to integer milliseconds like Excel
+            if delta_ms > variance_threshold_ms:
+                exceeding_count += 1
+    
+    summary_lines.append("")
+    summary_lines.append("Variance threshold analysis:")
+    summary_lines.append(f"  Threshold: {variance_threshold_ms} milliseconds")
+    summary_lines.append(f"  Servers exceeding threshold: {exceeding_count}")
+    if stats.successful_servers > 0:
+        percentage = (exceeding_count / stats.successful_servers) * 100
+        summary_lines.append(f"  Percentage exceeding: {percentage:.1f}%")
     
     # Delta statistics for successful measurements
     if stats.min_delta is not None and stats.max_delta is not None and stats.avg_delta is not None:
@@ -1587,7 +1708,7 @@ def write_summary_file(summary_text: str, output_path: Path) -> None:
         # Don't raise exception - summary file is not critical
 
 
-def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, stats: SummaryStats, ini_config: dict) -> None:
+def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, stats: SummaryStats, ini_config: dict, results: List[NTPResult], reference_server: str) -> None:
     """
     Send email notification with NTP monitoring results.
     
@@ -1597,6 +1718,8 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         txt_path: Path to summary text file
         stats: Summary statistics for subject line generation
         ini_config: INI configuration with email settings
+        results: List of NTPResult objects for threshold analysis
+        reference_server: Reference NTP server hostname for exclusion from counts
     """
     logger = logging.getLogger(__name__)
     
@@ -1606,15 +1729,29 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         return
     
     try:
-        # Determine if this is an error condition
-        error_threshold = ini_config.get('error_threshold_seconds', 0.2)
+        # Determine if this is an error condition based on variance threshold
+        variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
         has_error = False
         max_delta_abs = 0.0
+        exceeding_count = 0
+        
+        # Count servers exceeding variance threshold
+        for result in results:
+            # Exclude reference server from threshold counting
+            if (result.status == NTPStatus.OK and 
+                result.delta_seconds is not None and 
+                result.ntp_server != reference_server):
+                # Use same rounding logic as Excel formatting for consistency
+                delta_ms = int(round(abs(result.delta_seconds) * 1000))  # Convert to integer milliseconds like Excel
+                if delta_ms > variance_threshold_ms:
+                    exceeding_count += 1
         
         if stats.max_delta is not None:
             # stats.max_delta is already the maximum absolute value from calculate_statistics
             max_delta_abs = stats.max_delta
-            has_error = max_delta_abs > error_threshold
+            # Convert to milliseconds for comparison with threshold
+            max_delta_ms = max_delta_abs * 1000
+            has_error = max_delta_ms > variance_threshold_ms
         
         # Generate subject line
         domain_name = ini_config.get('default_discovery_domain', 'unknown')
@@ -1625,14 +1762,20 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         else:
             subject_prefix = "NTP REPORT"
         
-        # Format max delta for subject
-        if stats.max_delta is not None:
-            if ini_config.get('default_format', 'seconds') == 'milliseconds':
-                max_delta_str = f"{max_delta_abs * 1000:.0f}ms"
-            else:
-                max_delta_str = f"{max_delta_abs:.3f}s"
+        # Format delta section for subject - enhanced logic for threshold exceeded
+        if exceeding_count > 0:
+            # When servers exceed threshold, show "MAX DELTA EXCEEDED" with count
+            delta_section = f"MAX DELTA EXCEEDED ({exceeding_count} servers)"
         else:
-            max_delta_str = "N/A"
+            # When no servers exceed threshold, show traditional "Max Delta" format
+            if stats.max_delta is not None:
+                if ini_config.get('default_format', 'seconds') == 'milliseconds':
+                    max_delta_str = f"{max_delta_abs * 1000:.0f}ms"
+                else:
+                    max_delta_str = f"{max_delta_abs:.3f}s"
+            else:
+                max_delta_str = "N/A"
+            delta_section = f"Max Delta: {max_delta_str}"
         
         # Format server status for subject
         if failed_count == 0:
@@ -1640,7 +1783,7 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         else:
             server_status = f"{failed_count} servers not responding"
         
-        subject = f"{subject_prefix} {domain_name} - Max Delta: {max_delta_str} - {server_status}"
+        subject = f"{subject_prefix} {domain_name} - {delta_section} - {server_status}"
         
         logger.info(f"Sending email notification: {subject}")
         
@@ -1801,19 +1944,19 @@ def main():
         results = process_servers_parallel(ntp_servers, config.reference_ntp, config, ini_config)
         
         # Generate XLSX report
-        output_path = get_output_file_path(config)
+        output_path = get_output_file_path(config, ini_config)
         write_xlsx_report(results, output_path, config, ini_config)
         
         # Generate summary statistics
         stats = calculate_statistics(results)
-        summary_text = format_summary(stats, config)
+        summary_text = format_summary(stats, config, ini_config, results)
         
         # Write summary to text file
         write_summary_file(summary_text, output_path)
         
         # Send email notification if enabled
         txt_path = output_path.with_suffix('.txt')
-        send_email_notification(summary_text, output_path, txt_path, stats, ini_config)
+        send_email_notification(summary_text, output_path, txt_path, stats, ini_config, results, config.reference_ntp)
         
         # Display end-of-run summary
         print(summary_text)
