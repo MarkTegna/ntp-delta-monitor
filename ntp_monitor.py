@@ -1121,7 +1121,7 @@ Default Behavior:
     parser.add_argument(
         '--version',
         action='version',
-        version='NTP Delta Monitor 2.2.0'
+        version='NTP Delta Monitor 2.2.2'
     )
     
     args = parser.parse_args()
@@ -1753,6 +1753,10 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
             max_delta_ms = max_delta_abs * 1000
             has_error = max_delta_ms > variance_threshold_ms
         
+        # Also set error flag if any servers are not responding
+        if stats.failed_servers > 0:
+            has_error = True
+        
         # Generate subject line
         domain_name = ini_config.get('default_discovery_domain', 'unknown')
         failed_count = stats.failed_servers
@@ -1792,6 +1796,12 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         msg['From'] = ini_config.get('from_email', 'ntp-monitor@tgna.tegna.com')
         msg['To'] = ini_config.get('to_email', 'moldham@tegna.com')
         msg['Subject'] = subject
+        
+        # Set high importance for error conditions
+        if has_error:
+            msg['X-Priority'] = '1'  # High priority (1=High, 3=Normal, 5=Low)
+            msg['X-MSMail-Priority'] = 'High'  # Microsoft Outlook priority
+            msg['Importance'] = 'High'  # Standard importance header
         
         # Use summary text as email body
         msg.attach(MIMEText(summary_text, 'plain'))
