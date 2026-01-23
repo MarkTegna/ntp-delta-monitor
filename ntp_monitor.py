@@ -60,6 +60,7 @@ class NTPResponse:
     root_delay_ms: float
     root_dispersion_ms: float
     is_synchronized: bool
+    offset_seconds: float  # NTP offset (time difference accounting for network delay)
     error_message: Optional[str] = None
 
 
@@ -105,6 +106,7 @@ class NTPResult:
     delta_formatted: Optional[float]  # formatted according to config (seconds/milliseconds)
     status: NTPStatus
     error_message: Optional[str] = None
+    is_additional_server: bool = False  # True if from additional servers CSV (excluded from error counts)
 
 
 @dataclass
@@ -112,6 +114,7 @@ class Config:
     """Configuration data model for NTP monitor"""
     reference_ntp: str  # Primary reference NTP source
     ntp_servers_file: Optional[Path]  # Path to NTP server list file (None for auto-discovery)
+    additional_servers_file: Optional[Path]  # Path to additional servers CSV file (excluded from error counts)
     output_file: Optional[Path]
     format_type: str  # 'seconds' or 'milliseconds'
     parallel_limit: int
@@ -198,6 +201,7 @@ def query_ntp_server(hostname: str, timeout: int = 30) -> NTPResponse:
             root_delay_ms=root_delay_ms,
             root_dispersion_ms=root_dispersion_ms,
             is_synchronized=is_synchronized,
+            offset_seconds=response.offset,  # NTP offset (accounts for network delay)
             error_message=None
         )
         
@@ -482,6 +486,135 @@ def parse_csv_file(file_path: Path) -> List[str]:
         raise
 
 
+def parse_additional_servers_csv(file_path: Path) -> List[tuple]:
+    """
+    Parse additional servers CSV file with server and optional short_name/location columns.
+    Automatically adds missing column headers and writes corrected file back to disk.
+    
+    Args:
+        file_path: Path to CSV file with 'server' and optional 'short_name' or 'location' columns
+        
+    Returns:
+        List of tuples (server, short_name) where short_name uses full server name if not provided
+    """
+    logger = logging.getLogger(__name__)
+    servers = []
+    file_needs_correction = False
+    
+    try:
+        logger.debug(f"Opening additional servers CSV file for parsing: {file_path}")
+        
+        # First, read the file to check its format
+        with open(file_path, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            f.seek(0)  # Reset to beginning
+            all_lines = f.readlines()
+        
+        # Check if the first line looks like headers or data
+        has_proper_headers = False
+        if first_line and ('server' in first_line.lower() or 'short_name' in first_line.lower()):
+            # Try to parse as CSV with headers
+            try:
+                reader = csv.DictReader(all_lines)
+                fieldnames = reader.fieldnames
+                if fieldnames and 'server' in fieldnames:
+                    has_proper_headers = True
+                    logger.debug(f"CSV has proper headers: {fieldnames}")
+            except:
+                has_proper_headers = False
+        
+        if not has_proper_headers:
+            logger.info(f"CSV file missing proper headers, will add them and rewrite file")
+            file_needs_correction = True
+            
+            # Parse as raw data (no headers)
+            raw_servers = []
+            for line_num, line in enumerate(all_lines, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Split by comma to handle both single and multi-column formats
+                parts = [part.strip() for part in line.split(',')]
+                server = parts[0] if parts else ''
+                short_name = parts[1] if len(parts) > 1 and parts[1] else ''
+                
+                if server:
+                    raw_servers.append((server, short_name))
+                    logger.debug(f"Line {line_num}: Parsed server '{server}' with short name '{short_name}'")
+            
+            # Write corrected CSV file with proper headers
+            logger.info(f"Writing corrected CSV file with headers to: {file_path}")
+            with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                # Write header row
+                writer.writerow(['server', 'short_name'])
+                # Write data rows
+                for server, short_name in raw_servers:
+                    writer.writerow([server, short_name])
+            
+            logger.info(f"Successfully rewrote CSV file with proper headers")
+        
+        # Now read the file with proper CSV parsing
+        with open(file_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            # Log available columns for debugging
+            logger.debug(f"CSV columns found: {reader.fieldnames}")
+            
+            # Check if server column exists (should exist now after correction)
+            if 'server' not in reader.fieldnames:
+                logger.error(f"CSV file still missing required 'server' column after correction. Found columns: {reader.fieldnames}")
+                raise Exception("Missing 'server' column in CSV file")
+            
+            # Check if short_name or location column exists
+            has_short_name_column = 'short_name' in reader.fieldnames
+            has_location_column = 'location' in reader.fieldnames
+            
+            if has_short_name_column:
+                logger.debug("Found 'short_name' column in CSV file")
+                name_column = 'short_name'
+            elif has_location_column:
+                logger.debug("Found 'location' column in CSV file (using as short name)")
+                name_column = 'location'
+            else:
+                logger.debug("No 'short_name' or 'location' column found, will use full server names")
+                name_column = None
+            
+            for row_num, row in enumerate(reader, 2):  # Start at 2 since row 1 is header
+                # Process server column
+                server = row.get('server', '').strip()
+                if not server:
+                    logger.debug(f"Row {row_num}: Skipped empty server entry")
+                    continue
+                
+                # Process short_name or location column (optional)
+                short_name = None
+                if name_column:
+                    short_name = row.get(name_column, '').strip()
+                
+                # If no short_name provided, use the full server name
+                # (Don't trim - additional servers should keep their full names)
+                if not short_name:
+                    short_name = server
+                
+                servers.append((server, short_name))
+                logger.debug(f"Row {row_num}: Added server '{server}' with short name '{short_name}'")
+        
+        if file_needs_correction:
+            logger.info(f"Successfully corrected and re-parsed CSV file with {len(servers)} servers")
+        else:
+            logger.info(f"Parsed {len(servers)} additional servers from CSV file")
+            
+        server_list = [f"{server} ({short_name})" for server, short_name in servers]
+        logger.debug(f"Additional server list: {', '.join(server_list)}")
+        return servers
+        
+    except Exception as e:
+        logger.error(f"Error reading additional servers CSV file {file_path}: {e}")
+        raise
+
+
 def get_all_domain_ips(domain: str, timeout: int = 10) -> List[str]:
     """
     Get all A records (IP addresses) for the specified domain.
@@ -687,7 +820,7 @@ def calculate_time_delta(target_time: Optional[datetime], reference_time: dateti
     return delta_seconds
 
 
-def process_single_server(server: str, reference_server: str, config: Config, ini_config: dict) -> NTPResult:
+def process_single_server(server: str, reference_offset: float, reference_query_time: datetime, config: Config, ini_config: dict, is_additional_server: bool = False, custom_short_name: str = None) -> NTPResult:
     """
     Process a single NTP server with DNS resolution, query, and delta calculation.
     
@@ -696,7 +829,8 @@ def process_single_server(server: str, reference_server: str, config: Config, in
     
     Args:
         server: NTP server hostname or IP address
-        reference_server: Reference NTP server hostname for fresh reference queries
+        reference_offset: Reference NTP server offset (from batch query)
+        reference_query_time: Wall clock time when reference was queried (unused, kept for compatibility)
         config: Configuration object with timeout and format settings
         
     Returns:
@@ -712,28 +846,31 @@ def process_single_server(server: str, reference_server: str, config: Config, in
     # Perform reverse DNS lookup to get hostname information
     full_hostname = None
     short_name = None
+    
+    # Use custom short name if provided (for additional servers)
+    if custom_short_name:
+        short_name = custom_short_name
+        logger.debug(f"Using custom short name: {custom_short_name}")
+    
     if resolved_ip:
-        full_hostname, short_name = perform_reverse_dns_lookup(resolved_ip, ini_config['default_discovery_domain'], config.ntp_timeout)
+        full_hostname, dns_short_name = perform_reverse_dns_lookup(resolved_ip, ini_config['default_discovery_domain'], config.ntp_timeout)
+        # Only use DNS-derived short name if no custom short name was provided
+        if not custom_short_name:
+            short_name = dns_short_name
     
     try:
         # Query the NTP server
         logger.debug(f"Querying NTP server: {server} (using {hostname_to_use})")
         ntp_response = query_ntp_server(hostname_to_use, config.ntp_timeout)
         
-        # Calculate delta by querying reference server fresh to avoid drift
-        delta_seconds = None
-        delta_formatted = None
-        if server != reference_server:  # Don't calculate delta for reference server against itself
-            try:
-                # Query reference server fresh to avoid time drift
-                logger.debug(f"Querying reference server {reference_server} for fresh timestamp")
-                reference_response = query_ntp_server(reference_server, config.ntp_timeout)
-                delta_seconds = calculate_time_delta(ntp_response.timestamp_utc, reference_response.timestamp_utc)
-                delta_formatted = format_delta_value(delta_seconds, config.format_type)
-                logger.debug(f"Fresh delta calculated: {delta_seconds:.6f}s")
-            except Exception as e:
-                logger.debug(f"Failed to query reference server for delta calculation: {e}")
-                # Continue without delta calculation if reference query fails
+        # Calculate delta using NTP offsets
+        # The offset from each server tells us how much that server differs from our local clock
+        # To find the difference between two servers, we subtract their offsets
+        # Delta = target_offset - reference_offset
+        # This gives us the time difference between the two NTP servers
+        delta_seconds = ntp_response.offset_seconds - reference_offset
+        delta_formatted = format_delta_value(delta_seconds, config.format_type)
+        logger.debug(f"Delta calculated: {delta_seconds:.6f}s (target offset: {ntp_response.offset_seconds:.6f}s, reference offset: {reference_offset:.6f}s)")
         
         # Determine final status based on validation
         status, error_message = validate_ntp_response(ntp_response)
@@ -752,7 +889,8 @@ def process_single_server(server: str, reference_server: str, config: Config, in
             delta_seconds=delta_seconds,
             delta_formatted=delta_formatted,
             status=status,
-            error_message=error_message
+            error_message=error_message,
+            is_additional_server=is_additional_server
         )
         
     except Exception as e:
@@ -776,11 +914,12 @@ def process_single_server(server: str, reference_server: str, config: Config, in
             delta_seconds=None,  # No delta calculation for failed queries
             delta_formatted=None,  # No formatted delta for failed queries
             status=status,
-            error_message=error_message
+            error_message=error_message,
+            is_additional_server=is_additional_server
         )
 
 
-def process_servers_parallel(server_list: List[str], reference_server: str, config: Config, ini_config: dict) -> List[NTPResult]:
+def process_servers_parallel(server_list, reference_server: str, config: Config, ini_config: dict, is_additional_servers: bool = False) -> List[NTPResult]:
     """
     Process multiple NTP servers concurrently using thread pool.
     
@@ -788,9 +927,10 @@ def process_servers_parallel(server_list: List[str], reference_server: str, conf
     - Requirements 3.5: Continue processing remaining servers on individual failures
     
     Args:
-        server_list: List of NTP server hostnames/IPs to query
-        reference_server: Reference NTP server hostname for fresh reference queries
+        server_list: List of NTP server hostnames/IPs (strings) or tuples (server, short_name) for additional servers
+        reference_server: Reference NTP server hostname for batch reference query
         config: Configuration object with parallel limits and timeout settings
+        is_additional_servers: True if processing additional servers (excludes from error counts)
         
     Returns:
         List of NTPResult objects with query results for all servers.
@@ -802,6 +942,18 @@ def process_servers_parallel(server_list: List[str], reference_server: str, conf
     
     if not server_list:
         logger.warning("No servers to process")
+        return results
+    
+    # Query reference server once at the start of batch processing
+    logger.info(f"Querying reference server once for batch: {reference_server}")
+    reference_query_time = datetime.now(timezone.utc)
+    try:
+        reference_response = query_ntp_server(reference_server, config.ntp_timeout)
+        reference_offset = reference_response.offset_seconds
+        logger.info(f"Reference offset captured: {reference_offset:.6f}s (stratum {reference_response.stratum})")
+    except Exception as e:
+        logger.error(f"Failed to query reference server {reference_server}: {e}")
+        logger.error("Cannot proceed without reference time")
         return results
     
     # Use configured parallel limit, default to 10 if not specified
@@ -818,10 +970,19 @@ def process_servers_parallel(server_list: List[str], reference_server: str, conf
     # Create thread pool and submit all server processing tasks
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks - continue processing even if some fail
-        future_to_server = {
-            executor.submit(process_single_server, server, reference_server, config, ini_config): server
-            for server in server_list
-        }
+        future_to_server = {}
+        
+        for item in server_list:
+            if is_additional_servers and isinstance(item, tuple):
+                # Additional servers: (server, short_name)
+                server, custom_short_name = item
+                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers, custom_short_name)
+            else:
+                # Regular servers: just server string
+                server = item
+                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers)
+            
+            future_to_server[future] = server if isinstance(item, str) else item[0]
         
         # Collect results as they complete - maintain processing state across failures
         for future in as_completed(future_to_server):
@@ -863,7 +1024,8 @@ def process_servers_parallel(server_list: List[str], reference_server: str, conf
                     delta_seconds=None,
                     delta_formatted=None,
                     status=NTPStatus.ERROR,
-                    error_message=f"Unexpected processing error: {e}"
+                    error_message=f"Unexpected processing error: {e}",
+                    is_additional_server=is_additional_servers
                 )
                 results.append(error_result)
     
@@ -889,26 +1051,26 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
     """
     logger = logging.getLogger(__name__)
     
-    # Default configuration values
+    # Default configuration values (used when no INI file exists)
     defaults = {
-        'default_reference_server': 'ntp1.tgna.tegna.com',
-        'default_discovery_domain': 'tgna.tegna.com',
-        'fallback_servers': ['ntp1.tgna.tegna.com', 'ntp2.tgna.tegna.com', 'ntp3.tgna.tegna.com', 'ntp4.tgna.tegna.com'],
-        'default_format': 'seconds',
+        'default_reference_server': 'time.cloudflare.com',
+        'default_discovery_domain': 'pool.ntp.org',
+        'fallback_servers': ['time.cloudflare.com', 'time.google.com', 'time.windows.com', 'pool.ntp.org'],
+        'default_format': 'milliseconds',
         'default_parallel_limit': 10,
         'default_timeout': 30,
         'output_directory': '.\\Reports',
         'sort_by_variance': True,
         'max_variance_display': 100,
         # Email settings
-        'send_email': True,
-        'smtp_server': 'relay.tgna.tegna.com',
+        'send_email': False,
+        'smtp_server': '',
         'smtp_port': 25,
         'smtp_use_tls': False,
         'smtp_username': '',
         'smtp_password': '',
-        'from_email': 'ntp-monitor@tgna.tegna.com',
-        'to_email': 'moldham@tegna.com',
+        'from_email': '',
+        'to_email': '',
         'variance_threshold_ms': 33
     }
     
@@ -1044,6 +1206,13 @@ Examples:
     
   Milliseconds format with custom output file:
     %(prog)s -r 10.176.127.84 -s servers.csv -f milliseconds -o sync_report.xlsx
+    
+  Include additional servers for monitoring (excluded from error counts):
+    %(prog)s -r ntp1.example.com -s primary_servers.txt --additional-servers monitoring_servers.csv
+    
+  Auto-detect external_ntp_servers.csv in current directory:
+    %(prog)s
+    (Will automatically use external_ntp_servers.csv if present)
 
 Server List File Formats:
   TXT format: One NTP server hostname or IP per line
@@ -1057,6 +1226,33 @@ Server List File Formats:
       server,location,notes
       ntp1.example.com,datacenter1,primary
       ntp2.example.com,datacenter2,backup
+
+Additional Servers CSV Format:
+  CSV format with 'server' and optional 'short_name' or 'location' columns:
+    Example with short_name:
+      server,short_name
+      10.43.9.64,GPS-KING
+      10.176.127.84,GPS-KGW
+      pool.ntp.org,
+      time.google.com,
+    
+    Example with location:
+      server,location,notes
+      pool.ntp.org,NTP Pool,Public NTP server
+      10.43.9.64,GPS-KING,TEGNA Real GPS at KING
+      time.google.com,time.google.com,GOOGLE domain time default
+  
+  - First column 'server': NTP server hostname or IP address (required)
+  - Second column 'short_name' or 'location': Custom display name (optional)
+  - If no display name provided, uses full server name (not trimmed)
+  - Additional columns (like 'notes') are ignored
+  
+  Additional servers are included in reports and statistics but excluded from:
+  - Error counts and failure statistics
+  - Email alert triggers (NTP ERROR conditions)
+  - Exit code determination
+  
+  Use for monitoring servers that should not trigger alerts when failing.
 
 Default Behavior:
   When no arguments are provided, the program will:
@@ -1078,6 +1274,13 @@ Default Behavior:
         type=Path,
         metavar='FILE',
         help=f'Path to NTP server list file (.txt or .csv format) (default: query all A records from {ini_config["default_discovery_domain"]} domain)'
+    )
+    
+    parser.add_argument(
+        '--additional-servers',
+        type=Path,
+        metavar='FILE',
+        help='Path to CSV file with additional NTP servers to monitor (included in report but excluded from error counts and alerts). Auto-detects "external_ntp_servers.csv" in current directory if present.'
     )
     
     # Optional arguments with detailed help
@@ -1121,7 +1324,7 @@ Default Behavior:
     parser.add_argument(
         '--version',
         action='version',
-        version='NTP Delta Monitor 2.2.2'
+        version='NTP Delta Monitor 2.4.3'
     )
     
     args = parser.parse_args()
@@ -1129,6 +1332,16 @@ Default Behavior:
     # Set default values if not provided
     reference_ntp = args.reference_ntp or ini_config['default_reference_server']
     servers_file = args.servers_file
+    
+    # Auto-detect external_ntp_servers.csv if not specified via CLI
+    additional_servers_file = args.additional_servers
+    if additional_servers_file is None:
+        # Look for external_ntp_servers.csv in current directory
+        default_additional_file = Path('external_ntp_servers.csv')
+        if default_additional_file.exists() and default_additional_file.is_file():
+            additional_servers_file = default_additional_file
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Auto-detected additional servers file: {default_additional_file}")
     
     # Comprehensive argument validation with detailed error messages
     validation_errors = []
@@ -1181,6 +1394,7 @@ Default Behavior:
     return Config(
         reference_ntp=reference_ntp,
         ntp_servers_file=servers_file,
+        additional_servers_file=additional_servers_file,
         output_file=args.output_file,
         format_type=args.format,
         parallel_limit=args.parallel_limit,
@@ -1251,59 +1465,83 @@ def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = 
     """
     Sort NTP results by variance from zero (highest to lowest absolute delta values).
     Error servers are placed at the top of the list for immediate attention.
+    Additional servers are placed at the bottom as a separate section.
     
     Args:
         results: List of NTPResult objects to sort
         sort_by_variance: Whether to sort by variance (True) or keep original order (False)
         
     Returns:
-        Sorted list of NTPResult objects with error servers first
+        Sorted list of NTPResult objects with error servers first, then primary servers by variance, then additional servers
     """
     if not sort_by_variance:
         return results
     
     logger = logging.getLogger(__name__)
-    logger.debug("Sorting results with error servers first, then by variance from zero")
+    logger.debug("Sorting results with error servers first, primary servers by variance, additional servers at bottom")
     
-    # Separate results by status: errors first, then successful with/without delta
-    error_results = []
-    results_with_delta = []
-    results_without_delta = []
+    # Separate primary and additional servers
+    primary_results = [r for r in results if not r.is_additional_server]
+    additional_results = [r for r in results if r.is_additional_server]
     
-    for result in results:
+    # Sort primary servers: errors first, then by variance
+    primary_error_results = []
+    primary_results_with_delta = []
+    primary_results_without_delta = []
+    
+    for result in primary_results:
         # Put error servers at the top of the list
         if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED, NTPStatus.UNREACHABLE]:
-            error_results.append(result)
+            primary_error_results.append(result)
         elif result.delta_seconds is not None:
-            results_with_delta.append(result)
+            primary_results_with_delta.append(result)
         else:
-            results_without_delta.append(result)
+            primary_results_without_delta.append(result)
     
-    # Sort error results by status severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE)
+    # Sort primary error results by status severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE)
     status_priority = {
         NTPStatus.ERROR: 1,
         NTPStatus.TIMEOUT: 2, 
         NTPStatus.UNSYNCHRONIZED: 3,
         NTPStatus.UNREACHABLE: 4
     }
-    error_results.sort(key=lambda x: status_priority.get(x.status, 5))
+    primary_error_results.sort(key=lambda x: status_priority.get(x.status, 5))
     
-    # Sort successful results with delta by absolute value (highest variance first)
-    results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
+    # Sort primary successful results with delta by absolute value (highest variance first)
+    primary_results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
     
-    # Combine: error servers first, then sorted successful results, then results without delta
-    sorted_results = error_results + results_with_delta + results_without_delta
+    # Sort additional servers separately: errors first, then by variance
+    additional_error_results = []
+    additional_results_with_delta = []
+    additional_results_without_delta = []
     
-    logger.debug(f"Sorted {len(error_results)} error servers first, {len(results_with_delta)} results by variance, {len(results_without_delta)} results without delta appended")
+    for result in additional_results:
+        if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED, NTPStatus.UNREACHABLE]:
+            additional_error_results.append(result)
+        elif result.delta_seconds is not None:
+            additional_results_with_delta.append(result)
+        else:
+            additional_results_without_delta.append(result)
+    
+    # Sort additional servers the same way as primary servers
+    additional_error_results.sort(key=lambda x: status_priority.get(x.status, 5))
+    additional_results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
+    
+    # Combine: primary servers first (errors, then by variance), then additional servers at bottom
+    sorted_results = (primary_error_results + primary_results_with_delta + primary_results_without_delta + 
+                     additional_error_results + additional_results_with_delta + additional_results_without_delta)
+    
+    logger.debug(f"Sorted {len(primary_results)} primary servers (errors first, then by variance), {len(additional_results)} additional servers at bottom")
     
     return sorted_results
 
 
-def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Config, ini_config: dict) -> None:
+def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Config, ini_config: dict, reference_server: str) -> None:
     """
     Write NTP monitoring results to XLSX file with all required columns.
     
     Implements XLSX report generation with:
+    - Reference server row highlighted in bold blue
     - All required columns including hostname information
     - Formatted headers with styling
     - ISO 8601 UTC timestamp formatting
@@ -1316,6 +1554,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
         output_path: Path to output XLSX file
         config: Configuration object with format settings
         ini_config: INI configuration with sorting preferences
+        reference_server: Reference NTP server used for delta calculations (for highlighting)
         
     Raises:
         Exception: If XLSX file cannot be written
@@ -1361,7 +1600,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             cell.fill = header_fill
             cell.alignment = header_alignment
         
-        # Write data rows
+        # Write data rows (starting from row 2)
         for row_num, result in enumerate(sorted_results, 2):  # Start from row 2 (after headers)
             # Format timestamps in ISO 8601 UTC format
             timestamp_utc_str = result.timestamp_utc.isoformat() if result.timestamp_utc else ''
@@ -1386,16 +1625,27 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             
             # Write row data
             for col_num, value in enumerate(row_data, 1):
-                worksheet.cell(row=row_num, column=col_num, value=value)
+                cell = worksheet.cell(row=row_num, column=col_num, value=value)
+                
+                # Highlight reference server row in bold blue
+                if result.ntp_server == reference_server:
+                    cell.font = Font(bold=True, color="0000FF")
+                    logger.debug(f"Row {row_num}: Highlighted reference server '{reference_server}'")
         
         # Auto-adjust column widths
         for column in worksheet.columns:
             max_length = 0
-            column_letter = column[0].column_letter
+            # Skip merged cells
+            try:
+                column_letter = column[0].column_letter
+            except AttributeError:
+                # Skip merged cells
+                continue
             
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
+                    # Skip merged cells
+                    if hasattr(cell, 'column_letter') and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
                 except:
                     pass
@@ -1413,6 +1663,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
         highlighted_count = 0
         
         # Apply DIRECT cell formatting only (most reliable approach)
+        # Data rows start at row 2 (row 1 = headers)
         for row_num in range(2, len(sorted_results) + 2):
             # Status column direct formatting
             status_cell = worksheet.cell(row=row_num, column=status_col)
@@ -1465,7 +1716,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             
             # Check a few cells to verify formatting was preserved
             verification_count = 0
-            for row_num in range(2, min(10, len(sorted_results) + 2)):  # Check first 8 rows
+            for row_num in range(2, min(10, len(sorted_results) + 2)):  # Check first 8 data rows (starting from row 2)
                 delta_cell = test_ws.cell(row=row_num, column=delta_col)
                 if delta_cell.fill and delta_cell.fill.start_color:
                     color = delta_cell.fill.start_color.rgb if hasattr(delta_cell.fill.start_color, 'rgb') else str(delta_cell.fill.start_color)
@@ -1529,6 +1780,7 @@ def get_output_file_path(config: Config, ini_config: dict) -> Path:
 def calculate_statistics(results: List[NTPResult]) -> SummaryStats:
     """
     Calculate min/max/avg delta values for successful measurements and count success/failure rates.
+    Additional servers (is_additional_server=True) are excluded from error counts but included in delta statistics.
     
     Implements statistical calculation as required by:
     - Requirements 6.1: Display summary showing total servers processed and success/failure counts
@@ -1538,39 +1790,43 @@ def calculate_statistics(results: List[NTPResult]) -> SummaryStats:
         results: List of NTPResult objects from server processing
         
     Returns:
-        SummaryStats object with calculated statistics
+        SummaryStats object with calculated statistics (excluding additional servers from error counts)
     """
     logger = logging.getLogger(__name__)
     
-    total_servers = len(results)
+    # Separate primary servers from additional servers for error counting
+    primary_results = [r for r in results if not r.is_additional_server]
+    
+    total_servers = len(primary_results)  # Only count primary servers
     successful_servers = 0
     failed_servers = 0
     
-    # Count servers by status type
+    # Count servers by status type (primary servers only for error counts)
     status_counts = {}
     for status in NTPStatus:
         status_counts[status.value] = 0
     
-    # Collect successful delta values for statistical calculations
-    successful_deltas = []
-    
-    # Track if we have any error conditions for exit code determination
+    # Track if we have any error conditions for exit code determination (primary servers only)
     has_errors = False
     
-    for result in results:
+    # Process primary servers for error counts and status tracking
+    for result in primary_results:
         # Count by status
         status_counts[result.status.value] += 1
         
         if result.status == NTPStatus.OK:
             successful_servers += 1
-            # Collect delta values for successful measurements only
-            if result.delta_seconds is not None:
-                successful_deltas.append(result.delta_seconds)
         else:
             failed_servers += 1
             # Check for error conditions that should cause non-zero exit code
             if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED]:
                 has_errors = True
+    
+    # Collect delta values from ALL servers (including additional) for statistical calculations
+    successful_deltas = []
+    for result in results:
+        if result.status == NTPStatus.OK and result.delta_seconds is not None:
+            successful_deltas.append(result.delta_seconds)
     
     # Calculate min/max/avg delta values for successful measurements using absolute values
     min_delta = None
@@ -1585,6 +1841,7 @@ def calculate_statistics(results: List[NTPResult]) -> SummaryStats:
         avg_delta = statistics.mean(abs_deltas)
         
         logger.debug(f"Delta statistics calculated from {len(successful_deltas)} successful measurements using absolute values")
+        logger.debug(f"Statistics include {len([r for r in results if r.is_additional_server and r.status == NTPStatus.OK])} additional servers")
     else:
         logger.debug("No successful measurements available for delta statistics")
     
@@ -1635,13 +1892,14 @@ def format_summary(stats: SummaryStats, config: Config, ini_config: dict, result
     variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
     exceeding_count = 0
     
-    # Count servers exceeding variance threshold (exclude reference server)
+    # Count servers exceeding variance threshold (exclude reference server and additional servers)
     reference_server = config.reference_ntp
     for result in results:
-        # Exclude reference server from threshold counting
+        # Exclude reference server and additional servers from threshold counting
         if (result.status == NTPStatus.OK and 
             result.delta_seconds is not None and 
-            result.ntp_server != reference_server):
+            result.ntp_server != reference_server and
+            not result.is_additional_server):
             # Use same rounding logic as Excel formatting for consistency
             delta_ms = int(round(abs(result.delta_seconds) * 1000))  # Convert to integer milliseconds like Excel
             if delta_ms > variance_threshold_ms:
@@ -1735,12 +1993,13 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         max_delta_abs = 0.0
         exceeding_count = 0
         
-        # Count servers exceeding variance threshold
+        # Count servers exceeding variance threshold (exclude reference server and additional servers)
         for result in results:
-            # Exclude reference server from threshold counting
+            # Exclude reference server and additional servers from threshold counting
             if (result.status == NTPStatus.OK and 
                 result.delta_seconds is not None and 
-                result.ntp_server != reference_server):
+                result.ntp_server != reference_server and
+                not result.is_additional_server):
                 # Use same rounding logic as Excel formatting for consistency
                 delta_ms = int(round(abs(result.delta_seconds) * 1000))  # Convert to integer milliseconds like Excel
                 if delta_ms > variance_threshold_ms:
@@ -1953,9 +2212,26 @@ def main():
         logger.info("Processing target NTP servers...")
         results = process_servers_parallel(ntp_servers, config.reference_ntp, config, ini_config)
         
+        # Process additional servers if specified (excluded from error counts)
+        if config.additional_servers_file:
+            logger.info(f"Processing additional NTP servers from: {config.additional_servers_file}")
+            try:
+                # Use specialized parser for additional servers CSV with short names
+                additional_servers = parse_additional_servers_csv(config.additional_servers_file)
+                if additional_servers:
+                    logger.info(f"Loaded {len(additional_servers)} additional NTP servers for monitoring")
+                    additional_results = process_servers_parallel(additional_servers, config.reference_ntp, config, ini_config, is_additional_servers=True)
+                    results.extend(additional_results)
+                    logger.info(f"Combined results: {len(results)} total servers ({len(ntp_servers)} primary + {len(additional_servers)} additional)")
+                else:
+                    logger.warning(f"No additional servers found in {config.additional_servers_file}")
+            except Exception as e:
+                logger.error(f"Failed to process additional servers file {config.additional_servers_file}: {e}")
+                logger.info("Continuing with primary servers only")
+        
         # Generate XLSX report
         output_path = get_output_file_path(config, ini_config)
-        write_xlsx_report(results, output_path, config, ini_config)
+        write_xlsx_report(results, output_path, config, ini_config, config.reference_ntp)
         
         # Generate summary statistics
         stats = calculate_statistics(results)

@@ -1,0 +1,12 @@
+server,location,notes
+pool.ntp.org,NTP Pool,Public NTP server
+10.43.9.64,GPS-KING,TEGNA Real GPS at KING
+10.176.127.84,GPS-KGW,TEGNA Real GPS at KGW
+ntp.tgna.tegna.com,ntp.tgna.tegna.com,TEGNA domain time default
+ntp1.tgna.tegna.com,ntp1.tgna.tegna.com,TEGNA Anycast .55
+ntp2.tgna.tegna.com,ntp2.tgna.tegna.com,TEGNA Anycast .56
+time.apple.com,time.apple.com,APPLE domain time default
+time.google.com,time.google.com,GOOGLE domain time default
+time.cloudflare.com,time.cloudflare.com,CLOUDFLARE domain time default
+time.aws.com,time.aws.com,AWS domain time default
+time.windows.com,time.windows.com,WINDOWS domain time default
