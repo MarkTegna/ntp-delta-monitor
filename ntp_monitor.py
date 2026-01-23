@@ -1055,7 +1055,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
     defaults = {
         'default_reference_server': 'time.cloudflare.com',
         'default_discovery_domain': 'pool.ntp.org',
-        'fallback_servers': ['time.cloudflare.com', 'time.google.com', 'time.windows.com', 'pool.ntp.org'],
+        'fallback_servers': ['time.google.com', 'time.cloudflare.com', 'time.aws.com', 'time.windows.com'],
         'default_format': 'milliseconds',
         'default_parallel_limit': 10,
         'default_timeout': 30,
