@@ -11,6 +11,7 @@ import logging
 import ntplib
 import socket
 import sys
+import os
 import dns.resolver
 import dns.reversename
 import smtplib
@@ -28,6 +29,10 @@ import statistics
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+# Program version
+VERSION = "2.4.3"
+PROGRAM_NAME = "NTP Delta Monitor"
 
 
 class NTPStatus(Enum):
@@ -1324,7 +1329,7 @@ Default Behavior:
     parser.add_argument(
         '--version',
         action='version',
-        version='NTP Delta Monitor 2.4.3'
+        version=f'{PROGRAM_NAME} {VERSION}'
     )
     
     args = parser.parse_args()
@@ -1606,6 +1611,11 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             timestamp_utc_str = result.timestamp_utc.isoformat() if result.timestamp_utc else ''
             ntp_time_utc_str = result.ntp_time_utc.isoformat() if result.ntp_time_utc else ''
             
+            # Round RTT, Root Delay, and Root Dispersion to 2 decimal places
+            query_rtt_rounded = round(result.query_rtt_ms, 2) if result.query_rtt_ms is not None else ''
+            root_delay_rounded = round(result.root_delay_ms, 2) if result.root_delay_ms is not None else ''
+            root_dispersion_rounded = round(result.root_dispersion_ms, 2) if result.root_dispersion_ms is not None else ''
+            
             # Prepare row data (Hostname column removed per user request)
             row_data = [
                 timestamp_utc_str,
@@ -1613,10 +1623,10 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
                 result.ntp_server_ip or '',
                 result.short_name or '',
                 ntp_time_utc_str,
-                result.query_rtt_ms if result.query_rtt_ms is not None else '',
+                query_rtt_rounded,
                 result.stratum if result.stratum is not None else '',
-                result.root_delay_ms if result.root_delay_ms is not None else '',
-                result.root_dispersion_ms if result.root_dispersion_ms is not None else '',
+                root_delay_rounded,
+                root_dispersion_rounded,
                 result.delta_formatted if result.delta_formatted is not None else '',
                 config.format_type,
                 result.status.value,
@@ -1876,6 +1886,13 @@ def format_summary(stats: SummaryStats, config: Config, ini_config: dict, result
     summary_lines.append("=" * 60)
     summary_lines.append("NTP MONITORING SUMMARY")
     summary_lines.append("=" * 60)
+    
+    # Add execution environment information
+    summary_lines.append(f"Hostname: {socket.gethostname()}")
+    summary_lines.append(f"Execution path: {os.getcwd()}")
+    summary_lines.append(f"Program: {PROGRAM_NAME} v{VERSION}")
+    summary_lines.append("")
+    
     summary_lines.append(f"Total servers processed: {stats.total_servers}")
     summary_lines.append(f"Successful queries: {stats.successful_servers}")
     summary_lines.append(f"Failed queries: {stats.failed_servers}")
