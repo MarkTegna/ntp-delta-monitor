@@ -31,7 +31,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -115,6 +115,7 @@ class NTPResult:
     failure_count: int = 0  # Consecutive failure count for this server
     missed: int = 0  # Total connection error count (never resets)
     failed: str = 'ok'  # Status: 'failed' or 'ok'
+    time: int = 0  # Consecutive variance threshold violations (resets when within threshold)
 
 
 @dataclass
@@ -136,13 +137,14 @@ class ExtendedServerRecord:
     Extended server record with all tracking columns.
 
     Implements data structure requirements from:
-    - Requirement 7.1: Contains exactly 6 fields
+    - Requirement 7.1: Contains exactly 7 fields
     - Requirement 7.2: server is non-empty string
     - Requirement 7.3: failure_count is non-negative integer
     - Requirement 7.4: missed is non-negative integer
     - Requirement 7.5: failed is either 'ok' or 'failed'
     - Requirement 7.6: short_name can be any string including empty
     - Requirement 7.7: dlist can be any string
+    - Requirement 7.8: time is non-negative integer (consecutive variance violations)
     """
     server: str                    # NTP server hostname or IP
     short_name: str                # Display name (can be empty)
@@ -150,6 +152,7 @@ class ExtendedServerRecord:
     missed: int                    # Total connection errors (never resets)
     failed: str                    # Status: 'failed' or 'ok'
     dlist: str                     # Distribution list email address
+    time: int                      # Consecutive variance threshold violations (resets when within threshold)
 
     def __post_init__(self):
         """
@@ -160,6 +163,7 @@ class ExtendedServerRecord:
         - Requirement 7.3: failure_count must be non-negative integer
         - Requirement 7.4: missed must be non-negative integer
         - Requirement 7.5: failed must be 'ok' or 'failed'
+        - Requirement 7.8: time must be non-negative integer
         """
         # Validate server is non-empty
         if not self.server or not isinstance(self.server, str):
@@ -176,6 +180,10 @@ class ExtendedServerRecord:
         # Validate failed status
         if self.failed not in ('ok', 'failed'):
             raise ValueError(f"failed must be 'ok' or 'failed', got: {self.failed!r}")
+
+        # Validate time is non-negative integer
+        if not isinstance(self.time, int) or self.time < 0:
+            raise ValueError(f"time must be a non-negative integer, got: {self.time!r}")
 
 
 @dataclass
@@ -511,14 +519,16 @@ def update_failure_count(server: str, current_count: int, status: NTPStatus) -> 
 
 def update_tracking_counters(server: str, current_missed: int, current_failed: str,
                             status: NTPStatus, delta_seconds: Optional[float] = None,
-                            variance_threshold_ms: float = 33.0) -> tuple[int, str]:
+                            variance_threshold_ms: float = 33.0, current_time: int = 0) -> tuple[int, str, int]:
     """
-    Calculate updated tracking counters based on query status.
+    Calculate updated tracking counters based on query status and variance threshold.
 
     This function implements the core tracking logic for the new columns:
     - Resets missed counter on successful connection (status == OK)
     - Increments missed counter on any connection error
     - Sets failed status to 'failed' when missed >= 10, 'ok' otherwise
+    - Increments time counter when variance threshold is exceeded
+    - Resets time counter when variance is within threshold
 
     Implements requirements:
     - Requirement 3.1: Increment missed counter on non-OK status
@@ -529,30 +539,37 @@ def update_tracking_counters(server: str, current_missed: int, current_failed: s
     - Requirement 4.2: Set failed='ok' when missed < 10
     - Requirement 4.3: Log failed status updates
     - Requirement 4.4: Reset failed='ok' when connection is successful
+    - Requirement 5.1: Increment time counter when variance exceeds threshold
+    - Requirement 5.2: Reset time counter when variance is within threshold
 
     Args:
         server: Server hostname for logging
         current_missed: Current total missed count
         current_failed: Current failed status ('ok' or 'failed')
         status: NTP query result status
-        delta_seconds: Time delta in seconds (unused, kept for compatibility)
-        variance_threshold_ms: Variance threshold in milliseconds (unused, kept for compatibility)
+        delta_seconds: Time delta in seconds (used for variance checking)
+        variance_threshold_ms: Variance threshold in milliseconds
+        current_time: Current consecutive variance violation count
 
     Returns:
-        Tuple of (new_missed, new_failed)
+        Tuple of (new_missed, new_failed, new_time)
         - new_missed: Reset to 0 if OK, incremented if error
         - new_failed: 'failed' if new_missed >= 10, 'ok' otherwise
+        - new_time: Incremented if variance exceeded, reset to 0 if within threshold
 
     Preconditions:
         - server is non-empty string
         - current_missed is non-negative integer
         - current_failed is either 'ok' or 'failed'
         - status is valid NTPStatus enum value
+        - current_time is non-negative integer
 
     Postconditions:
         - new_missed = 0 if status == OK
         - new_missed = current_missed + 1 if status != OK
         - new_failed = 'failed' if new_missed >= 10, else 'ok'
+        - new_time = current_time + 1 if variance exceeded
+        - new_time = 0 if variance within threshold
     """
     logger = logging.getLogger(__name__)
 
@@ -583,7 +600,24 @@ def update_tracking_counters(server: str, current_missed: int, current_failed: s
         else:
             logger.debug(f"Server {server}: status remains 'ok' (missed={new_missed})")
 
-    return new_missed, new_failed
+    # Step 3: Update time counter based on variance threshold
+    new_time = current_time
+    if status == NTPStatus.OK and delta_seconds is not None:
+        # Only check variance for successful connections
+        delta_ms = abs(delta_seconds * 1000.0)
+        if delta_ms > variance_threshold_ms:
+            # Variance exceeded threshold - increment time counter
+            new_time = current_time + 1
+            logger.info(f"Server {server}: time count incremented to {new_time} (variance {delta_ms:.2f}ms > {variance_threshold_ms}ms)")
+        else:
+            # Variance within threshold - reset time counter
+            new_time = 0
+            if current_time > 0:
+                logger.info(f"Server {server}: time count RESET to 0 (was {current_time}) - variance {delta_ms:.2f}ms <= {variance_threshold_ms}ms")
+            else:
+                logger.debug(f"Server {server}: time count remains 0 - variance {delta_ms:.2f}ms <= {variance_threshold_ms}ms")
+
+    return new_missed, new_failed, new_time
 
 
 
@@ -721,22 +755,23 @@ def parse_csv_file(file_path: Path) -> List[str]:
         raise
 
 
-def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, int, str, str]]:
+def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, int, str, str, int]]:
     """
     Parse additional servers CSV file with extended tracking columns.
-    Supports backward compatibility with 2-column, 3-column, and 6-column formats.
+    Supports backward compatibility with 2-column, 3-column, 6-column, and 7-column formats.
 
     Args:
         file_path: Path to CSV file
 
     Returns:
-        List of tuples (server, short_name, failure_count, missed, failed, dlist)
+        List of tuples (server, short_name, failure_count, missed, failed, dlist, time)
         - server: NTP server hostname or IP
         - short_name: Display name for the server
         - failure_count: Consecutive failure count (existing)
         - missed: Total connection error count (never resets)
         - failed: Status string ('failed' if missed >= 10, 'ok' otherwise)
         - dlist: Distribution list email address
+        - time: Consecutive variance threshold violations (resets when within threshold)
     """
     logger = logging.getLogger(__name__)
     servers = []
@@ -761,6 +796,7 @@ def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, i
             has_missed = 'missed' in columns
             has_failed = 'failed' in columns
             has_dlist = 'dlist' in columns
+            has_time = 'time' in columns
 
             # Log missing columns and defaults
             missing_columns = []
@@ -770,10 +806,12 @@ def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, i
                 missing_columns.append('failed')
             if not has_dlist:
                 missing_columns.append('dlist')
+            if not has_time:
+                missing_columns.append('time')
 
             if missing_columns:
                 logger.info(f"Columns not found: {', '.join(missing_columns)}")
-                logger.info(f"Will apply defaults: missed=0, failed='ok', dlist='none'")
+                logger.info(f"Will apply defaults: missed=0, failed='ok', dlist='none', time=0")
 
             # Determine name column
             name_column = 'short_name' if 'short_name' in columns else ('location' if 'location' in columns else None)
@@ -837,8 +875,22 @@ def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, i
                     if dlist_str:
                         dlist = dlist_str
 
-                servers.append((server, short_name, failure_count, missed, failed, dlist))
-                logger.debug(f"Row {row_num}: Parsed server '{server}' (short_name='{short_name}', failure_count={failure_count}, missed={missed}, failed='{failed}', dlist='{dlist}')")
+                # Process time (optional, defaults to 0)
+                time = 0
+                if has_time:
+                    time_str = row.get('time', '').strip()
+                    if time_str:
+                        try:
+                            time = int(time_str)
+                            if time < 0:
+                                logger.warning(f"Row {row_num}: Negative time value {time} for server {server}, replacing with 0")
+                                time = 0
+                        except ValueError:
+                            logger.warning(f"Row {row_num}: Invalid time value '{time_str}' for server {server}, replacing with 0")
+                            time = 0
+
+                servers.append((server, short_name, failure_count, missed, failed, dlist, time))
+                logger.debug(f"Row {row_num}: Parsed server '{server}' (short_name='{short_name}', failure_count={failure_count}, missed={missed}, failed='{failed}', dlist='{dlist}', time={time})")
 
         logger.info(f"Parsed {len(servers)} servers from CSV file")
         return servers
@@ -848,13 +900,13 @@ def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str, int, i
         raise
 
 
-def write_additional_servers_csv(file_path: Path, servers: List[tuple[str, str, int, int, str, str]]) -> None:
+def write_additional_servers_csv(file_path: Path, servers: List[tuple[str, str, int, int, str, str, int]]) -> None:
     """
     Write updated server data with all tracking columns to CSV file using atomic write operation.
 
     Implements CSV writing as required by:
-    - Requirements 5.1: Write header row with all 6 columns in correct order
-    - Requirements 5.2: Write one data row per server with all 6 values
+    - Requirements 5.1: Write header row with all 7 columns in correct order
+    - Requirements 5.2: Write one data row per server with all 7 values
     - Requirements 5.3: Use UTF-8 encoding
     - Requirements 5.4: Use proper CSV formatting with quoted fields
     - Requirements 5.5: Log each row being written
@@ -867,7 +919,7 @@ def write_additional_servers_csv(file_path: Path, servers: List[tuple[str, str, 
 
     Args:
         file_path: Path to CSV file
-        servers: List of tuples (server, short_name, failure_count, missed, failed, dlist)
+        servers: List of tuples (server, short_name, failure_count, missed, failed, dlist, time)
 
     Raises:
         Exception: If file write operation fails (logged but non-fatal)
@@ -884,15 +936,15 @@ def write_additional_servers_csv(file_path: Path, servers: List[tuple[str, str, 
         with open(temp_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
 
-            # Write header row with all 6 columns in correct order (Requirement 5.1)
-            writer.writerow(['server', 'short_name', 'failure_count', 'missed', 'failed', 'dlist'])
-            logger.debug("Wrote header row: ['server', 'short_name', 'failure_count', 'missed', 'failed', 'dlist']")
+            # Write header row with all 7 columns in correct order (Requirement 5.1)
+            writer.writerow(['server', 'short_name', 'failure_count', 'missed', 'failed', 'dlist', 'time'])
+            logger.debug("Wrote header row: ['server', 'short_name', 'failure_count', 'missed', 'failed', 'dlist', 'time']")
 
             # Write data rows (Requirements 5.2, 5.5)
-            for server, short_name, failure_count, missed, failed, dlist in servers:
-                writer.writerow([server, short_name, failure_count, missed, failed, dlist])
+            for server, short_name, failure_count, missed, failed, dlist, time in servers:
+                writer.writerow([server, short_name, failure_count, missed, failed, dlist, time])
                 logger.debug(f"Wrote row: server={server}, short_name={short_name}, failure_count={failure_count}, "
-                           f"missed={missed}, failed={failed}, dlist={dlist}")
+                           f"missed={missed}, failed={failed}, dlist={dlist}, time={time}")
 
         # Atomic rename operation (Requirement 6.2)
         temp_path.replace(file_path)
@@ -1120,7 +1172,7 @@ def calculate_time_delta(target_time: Optional[datetime], reference_time: dateti
     return delta_seconds
 
 
-def process_single_server(server: str, reference_offset: float, reference_query_time: datetime, config: Config, ini_config: dict, is_additional_server: bool = False, custom_short_name: str = None, current_failure_count: int = 0, current_missed: int = 0, current_failed: str = 'ok') -> NTPResult:
+def process_single_server(server: str, reference_offset: float, reference_query_time: datetime, config: Config, ini_config: dict, is_additional_server: bool = False, custom_short_name: str = None, current_failure_count: int = 0, current_missed: int = 0, current_failed: str = 'ok', current_time: int = 0) -> NTPResult:
     """
     Process a single NTP server with DNS resolution, query, and delta calculation.
 
@@ -1186,8 +1238,12 @@ def process_single_server(server: str, reference_offset: float, reference_query_
         # Update failure count based on status
         updated_failure_count = update_failure_count(server, current_failure_count, status)
 
-        # Update tracking counters (missed and failed status)
-        updated_missed, updated_failed = update_tracking_counters(server, current_missed, current_failed, status)
+        # Update tracking counters (missed, failed status, and time)
+        # Get variance threshold from config
+        variance_threshold_ms = ini_config.get('variance_threshold_ms', 33.0)
+        updated_missed, updated_failed, updated_time = update_tracking_counters(
+            server, current_missed, current_failed, status, delta_seconds, variance_threshold_ms, current_time
+        )
 
         return NTPResult(
             timestamp_utc=query_timestamp,
@@ -1207,7 +1263,8 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             is_additional_server=is_additional_server,
             failure_count=updated_failure_count,
             missed=updated_missed,
-            failed=updated_failed
+            failed=updated_failed,
+            time=updated_time
         )
 
     except Exception as e:
@@ -1220,8 +1277,12 @@ def process_single_server(server: str, reference_offset: float, reference_query_
         # Update failure count based on error status
         updated_failure_count = update_failure_count(server, current_failure_count, status)
 
-        # Update tracking counters (missed and failed status)
-        updated_missed, updated_failed = update_tracking_counters(server, current_missed, current_failed, status)
+        # Update tracking counters (missed, failed status, and time)
+        # For errors, delta_seconds is None, so time counter won't be updated
+        variance_threshold_ms = ini_config.get('variance_threshold_ms', 33.0)
+        updated_missed, updated_failed, updated_time = update_tracking_counters(
+            server, current_missed, current_failed, status, None, variance_threshold_ms, current_time
+        )
 
         return NTPResult(
             timestamp_utc=query_timestamp,
@@ -1241,11 +1302,12 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             is_additional_server=is_additional_server,
             failure_count=updated_failure_count,
             missed=updated_missed,
-            failed=updated_failed
+            failed=updated_failed,
+            time=updated_time
         )
 
 
-def process_servers_parallel(server_list, reference_server: str, config: Config, ini_config: dict, is_additional_servers: bool = False, failure_counts: dict = None, missed_counts: dict = None, failed_statuses: dict = None) -> List[NTPResult]:
+def process_servers_parallel(server_list, reference_server: str, config: Config, ini_config: dict, is_additional_servers: bool = False, failure_counts: dict = None, missed_counts: dict = None, failed_statuses: dict = None, time_counts: dict = None) -> List[NTPResult]:
     """
     Process multiple NTP servers concurrently using thread pool.
 
@@ -1315,6 +1377,10 @@ def process_servers_parallel(server_list, reference_server: str, config: Config,
         if failed_statuses is None:
             failed_statuses = {}
 
+        # Initialize time_counts dict if not provided
+        if time_counts is None:
+            time_counts = {}
+
         for item in server_list:
             if is_additional_servers and isinstance(item, tuple):
                 # Additional servers: (server, short_name)
@@ -1322,14 +1388,16 @@ def process_servers_parallel(server_list, reference_server: str, config: Config,
                 current_failure_count = failure_counts.get(server, 0)
                 current_missed = missed_counts.get(server, 0)
                 current_failed = failed_statuses.get(server, 'ok')
-                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers, custom_short_name, current_failure_count, current_missed, current_failed)
+                current_time = time_counts.get(server, 0)
+                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers, custom_short_name, current_failure_count, current_missed, current_failed, current_time)
             else:
                 # Regular servers: just server string
                 server = item
                 current_failure_count = failure_counts.get(server, 0)
                 current_missed = missed_counts.get(server, 0)
                 current_failed = failed_statuses.get(server, 'ok')
-                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers, None, current_failure_count, current_missed, current_failed)
+                current_time = time_counts.get(server, 0)
+                future = executor.submit(process_single_server, server, reference_offset, reference_query_time, config, ini_config, is_additional_servers, None, current_failure_count, current_missed, current_failed, current_time)
 
             future_to_server[future] = server if isinstance(item, str) else item[0]
 
@@ -2589,14 +2657,15 @@ def main():
                     logger.info(f"Loaded {len(additional_servers_with_counts)} additional NTP servers for monitoring")
 
                     # Create tracking dictionaries for all counters
-                    failure_counts = {server: failure_count for server, _, failure_count, _, _, _ in additional_servers_with_counts}
-                    missed_counts = {server: missed for server, _, _, missed, _, _ in additional_servers_with_counts}
-                    failed_statuses = {server: failed for server, _, _, _, failed, _ in additional_servers_with_counts}
+                    failure_counts = {server: failure_count for server, _, failure_count, _, _, _, _ in additional_servers_with_counts}
+                    missed_counts = {server: missed for server, _, _, missed, _, _, _ in additional_servers_with_counts}
+                    failed_statuses = {server: failed for server, _, _, _, failed, _, _ in additional_servers_with_counts}
+                    time_counts = {server: time for server, _, _, _, _, _, time in additional_servers_with_counts}
                     logger.debug(f"Initialized tracking for {len(failure_counts)} servers")
 
                     # Process servers (pass tuples of server, short_name for processing)
-                    additional_servers_for_processing = [(server, short_name) for server, short_name, _, _, _, _ in additional_servers_with_counts]
-                    additional_results = process_servers_parallel(additional_servers_for_processing, config.reference_ntp, config, ini_config, is_additional_servers=True, failure_counts=failure_counts, missed_counts=missed_counts, failed_statuses=failed_statuses)
+                    additional_servers_for_processing = [(server, short_name) for server, short_name, _, _, _, _, _ in additional_servers_with_counts]
+                    additional_results = process_servers_parallel(additional_servers_for_processing, config.reference_ntp, config, ini_config, is_additional_servers=True, failure_counts=failure_counts, missed_counts=missed_counts, failed_statuses=failed_statuses, time_counts=time_counts)
                     results.extend(additional_results)
                     logger.info(f"Combined results: {len(results)} total servers ({len(ntp_servers)} primary + {len(additional_servers_with_counts)} additional)")
                 else:
@@ -2626,16 +2695,16 @@ def main():
             try:
                 # Update all tracking fields from results
                 updated_servers = []
-                for server, short_name, old_failure_count, old_missed, old_failed, old_dlist in additional_servers_with_counts:
+                for server, short_name, old_failure_count, old_missed, old_failed, old_dlist, old_time in additional_servers_with_counts:
                     # Find the result for this server
                     result = next((r for r in results if r.ntp_server == server and r.is_additional_server), None)
                     if result:
                         # Use all updated tracking fields from the result
-                        updated_servers.append((server, short_name, result.failure_count, result.missed, result.failed, old_dlist))
-                        logger.debug(f"Server {server}: failure_count={result.failure_count}, missed={result.missed}, failed={result.failed}")
+                        updated_servers.append((server, short_name, result.failure_count, result.missed, result.failed, old_dlist, result.time))
+                        logger.debug(f"Server {server}: failure_count={result.failure_count}, missed={result.missed}, failed={result.failed}, time={result.time}")
                     else:
                         # Server wasn't processed (shouldn't happen), keep old values
-                        updated_servers.append((server, short_name, old_failure_count, old_missed, old_failed, old_dlist))
+                        updated_servers.append((server, short_name, old_failure_count, old_missed, old_failed, old_dlist, old_time))
                         logger.warning(f"Server {server}: no result found, keeping old values")
 
                 # Write updated data to CSV
