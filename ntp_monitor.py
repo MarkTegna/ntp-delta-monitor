@@ -12,6 +12,7 @@ import os
 import smtplib
 import socket
 import statistics
+import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -66,6 +67,11 @@ class NTPResponse:
     root_dispersion_ms: float
     is_synchronized: bool
     offset_seconds: float  # NTP offset (time difference accounting for network delay)
+    leap_indicator: int = 0  # Leap second warning: 0=none, 1=+1s, 2=-1s, 3=unsync
+    precision: int = 0  # Clock precision as power of 2 (e.g., -20 = ~1μs)
+    ref_id: str = ''  # Reference ID (upstream source - GPS/PPS for stratum 1, IP for stratum 2+)
+    ref_time: Optional[datetime] = None  # When server clock was last set/corrected
+    poll_interval: int = 0  # Poll interval as power of 2 seconds
     error_message: Optional[str] = None
 
 
@@ -116,6 +122,11 @@ class NTPResult:
     missed: int = 0  # Total connection error count (never resets)
     failed: str = 'ok'  # Status: 'failed' or 'ok'
     time: int = 0  # Consecutive variance threshold violations (resets when within threshold)
+    leap_indicator: Optional[int] = None  # Leap second warning
+    precision: Optional[int] = None  # Clock precision as power of 2
+    ref_id: Optional[str] = None  # Reference source identifier
+    ref_time: Optional[datetime] = None  # Last clock correction time
+    poll_interval: Optional[int] = None  # Poll interval as power of 2 seconds
 
 
 @dataclass
@@ -316,6 +327,38 @@ def query_ntp_server(hostname: str, timeout: int = 30) -> NTPResponse:
         logger.debug(f"  Synchronized: {is_synchronized}")
         logger.debug(f"  Query duration: {query_duration:.3f}s")
 
+        # Extract additional NTP response fields
+        leap_indicator = response.leap
+        precision = response.precision
+        poll_interval = response.poll
+
+        # Extract reference ID - for stratum 1 it's a 4-char string, for stratum 2+ it's an IP
+        ref_id = ''
+        try:
+            raw_ref_id = response.ref_id
+            if response.stratum == 1:
+                # Stratum 1: ref_id is a 4-character ASCII string (e.g., 'GPS', 'PPS', 'GOOG')
+                ref_id = struct.pack('!I', int(raw_ref_id)).decode('ascii').rstrip('\x00')
+            else:
+                # Stratum 2+: ref_id is the IP address of the upstream server
+                ref_id = socket.inet_ntoa(struct.pack('!I', int(raw_ref_id)))
+        except (AttributeError, TypeError, ValueError, struct.error, OSError):
+            ref_id = str(raw_ref_id) if raw_ref_id else ''
+
+        # Extract reference timestamp (when clock was last set/corrected)
+        ref_time = None
+        try:
+            if response.ref_time and response.ref_time > 0:
+                ref_time = datetime.fromtimestamp(response.ref_time, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            ref_time = None
+
+        logger.debug(f"  Leap indicator: {leap_indicator}")
+        logger.debug(f"  Precision: 2^{precision} seconds")
+        logger.debug(f"  Reference ID: {ref_id}")
+        logger.debug(f"  Reference time: {ref_time.isoformat() if ref_time else 'N/A'}")
+        logger.debug(f"  Poll interval: 2^{poll_interval} seconds")
+
         ntp_response = NTPResponse(
             timestamp_utc=timestamp_utc,
             query_rtt_ms=query_rtt_ms,
@@ -324,6 +367,11 @@ def query_ntp_server(hostname: str, timeout: int = 30) -> NTPResponse:
             root_dispersion_ms=root_dispersion_ms,
             is_synchronized=is_synchronized,
             offset_seconds=response.offset,  # NTP offset (accounts for network delay)
+            leap_indicator=leap_indicator,
+            precision=precision,
+            ref_id=ref_id,
+            ref_time=ref_time,
+            poll_interval=poll_interval,
             error_message=None
         )
 
@@ -1264,7 +1312,12 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             failure_count=updated_failure_count,
             missed=updated_missed,
             failed=updated_failed,
-            time=updated_time
+            time=updated_time,
+            leap_indicator=ntp_response.leap_indicator,
+            precision=ntp_response.precision,
+            ref_id=ntp_response.ref_id,
+            ref_time=ntp_response.ref_time,
+            poll_interval=ntp_response.poll_interval
         )
 
     except Exception as e:
@@ -2002,6 +2055,11 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             'Root Dispersion (ms)',    # Root dispersion in milliseconds
             'Delta Value',             # Time delta in configured format
             'Delta Format',            # Format type ('seconds' or 'milliseconds')
+            'Leap Indicator',          # Leap second warning (0=none, 1=+1s, 2=-1s, 3=unsync)
+            'Precision',               # Clock precision as power of 2
+            'Reference ID',            # Upstream time source (GPS/PPS for stratum 1, IP for 2+)
+            'Reference Time (UTC)',    # When server clock was last set/corrected
+            'Poll Interval (s)',       # Poll interval in seconds (2^poll)
             'Status',                  # Query status (OK, TIMEOUT, ERROR, etc.)
             'Error Message'            # Error details for failed queries
         ]
@@ -2041,6 +2099,11 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
                 root_dispersion_rounded,
                 result.delta_formatted if result.delta_formatted is not None else '',
                 config.format_type,
+                result.leap_indicator if result.leap_indicator is not None else '',
+                result.precision if result.precision is not None else '',
+                result.ref_id or '',
+                result.ref_time.isoformat() if result.ref_time else '',
+                2 ** result.poll_interval if result.poll_interval is not None else '',
                 result.status.value,
                 result.error_message or ''
             ]
@@ -2077,7 +2140,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             worksheet.column_dimensions[column_letter].width = adjusted_width
 
         # Apply status column and variance highlighting - DIRECT APPROACH ONLY
-        status_col = 12  # Status column is now the 12th column (after removing Hostname)
+        status_col = 17  # Status column (after adding Leap, Precision, RefID, RefTime, Poll)
         delta_col = 10   # Delta Value column
         variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
 
