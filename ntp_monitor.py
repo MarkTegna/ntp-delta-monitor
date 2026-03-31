@@ -32,7 +32,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -127,6 +127,8 @@ class NTPResult:
     ref_id: Optional[str] = None  # Reference source identifier
     ref_time: Optional[datetime] = None  # Last clock correction time
     poll_interval: Optional[int] = None  # Poll interval as power of 2 seconds
+    kerberos_status: Optional[str] = None  # Kerberos KDC check result
+    dns_status: Optional[str] = None  # DNS service check result
 
 
 @dataclass
@@ -140,6 +142,7 @@ class Config:
     parallel_limit: int
     ntp_timeout: int
     verbose: bool
+    skip_threshold: int = 10  # Skip additional servers with failure_count >= this value
 
 
 @dataclass
@@ -668,8 +671,176 @@ def update_tracking_counters(server: str, current_missed: int, current_failed: s
     return new_missed, new_failed, new_time
 
 
+def check_kerberos_kdc(host: str, timeout: int = 5) -> str:
+    """
+    Check if a Kerberos KDC is responding by verifying port 88 (Kerberos) accepts
+    connections AND port 389 (LDAP) responds to an anonymous bind request.
+
+    The LDAP anonymous bind proves the DC is alive and processing requests — not just
+    that the port is open. A valid LDAP BindResponse confirms the directory service
+    is functional, which is a strong indicator the KDC is also operational since both
+    services run on the same Domain Controller.
+
+    Args:
+        host: Hostname or IP address to check
+        timeout: Connection timeout in seconds
+
+    Returns:
+        Status string:
+        - 'OK' if Kerberos port open AND LDAP responds with valid data
+        - 'KRB_ONLY' if Kerberos port open but LDAP not responding
+        - 'NO_RESPONSE' if Kerberos port is closed/unreachable
+        - 'ERROR: <details>' for unexpected errors
+    """
+    logger = logging.getLogger(__name__)
+
+    # Step 1: Check if Kerberos port 88 accepts TCP connections
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, 88))
+        sock.close()
+
+        if result != 0:
+            logger.debug(f"Kerberos KDC {host}: port 88 closed (connect_ex={result})")
+            return 'NO_RESPONSE'
+
+        logger.debug(f"Kerberos KDC {host}: port 88 open")
+    except socket.timeout:
+        logger.debug(f"Kerberos KDC {host}: port 88 connection timed out")
+        return 'NO_RESPONSE'
+    except Exception as e:
+        logger.debug(f"Kerberos KDC {host}: port 88 error: {e}")
+        return f'ERROR: {e}'
+
+    # Step 2: Verify LDAP responds to anonymous bind (proves DC is processing requests)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, 389))
+
+        # Anonymous LDAP Simple Bind Request (RFC 4511)
+        # MessageID=1, BindRequest(version=3, name="", simple auth="")
+        bind_request = bytes([
+            0x30, 0x0c,              # SEQUENCE (12 bytes)
+            0x02, 0x01, 0x01,        # INTEGER MessageID = 1
+            0x60, 0x07,              # APPLICATION 0 (BindRequest) (7 bytes)
+            0x02, 0x01, 0x03,        # INTEGER version = 3
+            0x04, 0x00,              # OCTET STRING name = "" (anonymous)
+            0x80, 0x00               # CONTEXT 0 (simple auth) = "" (no password)
+        ])
+
+        sock.sendall(bind_request)
+        resp = sock.recv(4096)
+        sock.close()
+
+        if resp and len(resp) > 5:
+            logger.debug(f"Kerberos KDC {host}: LDAP responded with {len(resp)} bytes (DC confirmed)")
+            return 'OK'
+
+        logger.debug(f"Kerberos KDC {host}: LDAP empty response")
+        return 'KRB_ONLY'
+
+    except socket.timeout:
+        logger.debug(f"Kerberos KDC {host}: LDAP timed out (port 88 open but LDAP unresponsive)")
+        return 'KRB_ONLY'
+    except ConnectionRefusedError:
+        logger.debug(f"Kerberos KDC {host}: LDAP port 389 refused (port 88 open but no LDAP)")
+        return 'KRB_ONLY'
+    except OSError as e:
+        logger.debug(f"Kerberos KDC {host}: LDAP error: {e}")
+        return 'KRB_ONLY'
+    except Exception as e:
+        logger.debug(f"Kerberos KDC {host}: unexpected LDAP error: {e}")
+        return f'ERROR: {e}'
 
 
+def check_dns_service(host: str, timeout: int = 5) -> str:
+    """
+    Check if a DNS server is responding by sending a real DNS query and verifying
+    the response contains valid DNS data.
+
+    Sends an A record query for a well-known domain (the server's own domain or
+    a root hint) and checks that the response is a valid DNS packet with the
+    correct transaction ID. This proves the DNS service is alive and processing
+    queries, not just that port 53 is open.
+
+    Args:
+        host: Hostname or IP address to check
+        timeout: Query timeout in seconds
+
+    Returns:
+        Status string:
+        - 'OK' if DNS responded with valid data
+        - 'NO_RESPONSE' if connection failed or timed out
+        - 'INVALID' if port is open but response is not valid DNS
+        - 'ERROR: <details>' for unexpected errors
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        # Build a minimal DNS query for "." (root) type NS
+        # This is the simplest query any DNS server should answer
+        import random
+        txn_id = random.randint(0, 65535)
+
+        # DNS header: ID, flags (standard query, recursion desired), 1 question, 0 answers
+        header = struct.pack('!HHHHHH',
+                             txn_id,    # Transaction ID
+                             0x0100,    # Flags: standard query, recursion desired
+                             1,         # Questions: 1
+                             0,         # Answer RRs: 0
+                             0,         # Authority RRs: 0
+                             0)         # Additional RRs: 0
+
+        # Question: "." (root) type NS (2) class IN (1)
+        # Root domain is encoded as a single zero-length label
+        question = b'\x00' + struct.pack('!HH', 2, 1)  # type=NS, class=IN
+
+        dns_query = header + question
+
+        # Send via UDP on port 53
+        logger.debug(f"Checking DNS service on {host}:53")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+
+        try:
+            sock.sendto(dns_query, (host, 53))
+            resp, addr = sock.recvfrom(4096)
+
+            if len(resp) < 12:
+                logger.debug(f"DNS {host}: response too short ({len(resp)} bytes)")
+                return 'INVALID'
+
+            # Parse response header
+            resp_id = struct.unpack('!H', resp[:2])[0]
+            resp_flags = struct.unpack('!H', resp[2:4])[0]
+
+            # Verify transaction ID matches
+            if resp_id != txn_id:
+                logger.debug(f"DNS {host}: transaction ID mismatch (sent {txn_id}, got {resp_id})")
+                return 'INVALID'
+
+            # Check QR bit (bit 15) - should be 1 for response
+            if not (resp_flags & 0x8000):
+                logger.debug(f"DNS {host}: QR bit not set (not a response)")
+                return 'INVALID'
+
+            logger.debug(f"DNS {host}: valid response received ({len(resp)} bytes, flags=0x{resp_flags:04x})")
+            return 'OK'
+
+        finally:
+            sock.close()
+
+    except socket.timeout:
+        logger.debug(f"DNS {host}: query timed out")
+        return 'NO_RESPONSE'
+    except OSError as e:
+        logger.debug(f"DNS {host}: connection error: {e}")
+        return 'NO_RESPONSE'
+    except Exception as e:
+        logger.debug(f"DNS {host}: unexpected error: {e}")
+        return f'ERROR: {e}'
 
 
 def parse_server_file(file_path: Path) -> List[str]:
@@ -1266,6 +1437,14 @@ def process_single_server(server: str, reference_offset: float, reference_query_
         if not custom_short_name:
             short_name = dns_short_name
 
+    # Check Kerberos KDC and DNS service status (primary servers only, not additional)
+    kerberos_status = None
+    dns_status = None
+    if not is_additional_server:
+        check_target = resolved_ip if resolved_ip else server
+        kerberos_status = check_kerberos_kdc(check_target, timeout=min(config.ntp_timeout, 5))
+        dns_status = check_dns_service(check_target, timeout=min(config.ntp_timeout, 5))
+
     try:
         # Query the NTP server
         logger.debug(f"Querying NTP server: {server} (using {hostname_to_use})")
@@ -1317,7 +1496,9 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             precision=ntp_response.precision,
             ref_id=ntp_response.ref_id,
             ref_time=ntp_response.ref_time,
-            poll_interval=ntp_response.poll_interval
+            poll_interval=ntp_response.poll_interval,
+            kerberos_status=kerberos_status,
+            dns_status=dns_status
         )
 
     except Exception as e:
@@ -1356,7 +1537,9 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             failure_count=updated_failure_count,
             missed=updated_missed,
             failed=updated_failed,
-            time=updated_time
+            time=updated_time,
+            kerberos_status=kerberos_status,
+            dns_status=dns_status
         )
 
 
@@ -1541,7 +1724,8 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
         'smtp_password': '',
         'from_email': '',
         'to_email': '',
-        'variance_threshold_ms': 33
+        'variance_threshold_ms': 33,
+        'skip_threshold': 10
     }
 
     config = configparser.ConfigParser()
@@ -1573,6 +1757,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
                 advanced_section = config['advanced_settings']
                 defaults['sort_by_variance'] = advanced_section.getboolean('sort_by_variance', defaults['sort_by_variance'])
                 defaults['max_variance_display'] = advanced_section.getint('max_variance_display', defaults['max_variance_display'])
+                defaults['skip_threshold'] = advanced_section.getint('skip_threshold', defaults['skip_threshold'])
 
             if 'email_settings' in config:
                 email_section = config['email_settings']
@@ -1753,6 +1938,14 @@ Default Behavior:
         help='Path to CSV file with additional NTP servers to monitor (included in report but excluded from error counts and alerts). Auto-detects "external_ntp_servers.csv" in current directory if present.'
     )
 
+    parser.add_argument(
+        '--skip-threshold',
+        type=int,
+        default=ini_config['skip_threshold'],
+        metavar='N',
+        help=f'Skip additional servers with failure_count >= this value (0 to disable skipping) [default: {ini_config["skip_threshold"]}]'
+    )
+
     # Optional arguments with detailed help
     parser.add_argument(
         '-o', '--output-file',
@@ -1869,7 +2062,8 @@ Default Behavior:
         format_type=args.format,
         parallel_limit=args.parallel_limit,
         ntp_timeout=args.timeout,
-        verbose=args.verbose
+        verbose=args.verbose,
+        skip_threshold=args.skip_threshold
     )
 
 
@@ -1960,22 +2154,31 @@ def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = 
     primary_results_without_delta = []
 
     for result in primary_results:
-        # Put error servers at the top of the list
+        # Put error servers and Kerberos failures at the top of the list
         if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED, NTPStatus.UNREACHABLE]:
+            primary_error_results.append(result)
+        elif result.kerberos_status and result.kerberos_status not in ('OK', None, ''):
+            primary_error_results.append(result)
+        elif result.dns_status and result.dns_status not in ('OK', None, ''):
             primary_error_results.append(result)
         elif result.delta_seconds is not None:
             primary_results_with_delta.append(result)
         else:
             primary_results_without_delta.append(result)
 
-    # Sort primary error results by status severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE)
+    # Sort primary error results by status severity (ERROR > TIMEOUT > UNSYNCHRONIZED > UNREACHABLE > KRB_FAIL)
     status_priority = {
         NTPStatus.ERROR: 1,
         NTPStatus.TIMEOUT: 2,
         NTPStatus.UNSYNCHRONIZED: 3,
         NTPStatus.UNREACHABLE: 4
     }
-    primary_error_results.sort(key=lambda x: status_priority.get(x.status, 5))
+    def _error_sort_key(x):
+        # NTP errors first (priority 1-4), then Kerberos failures (priority 5)
+        ntp_priority = status_priority.get(x.status, 5)
+        return ntp_priority
+
+    primary_error_results.sort(key=_error_sort_key)
 
     # Sort primary successful results with delta by absolute value (highest variance first)
     primary_results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
@@ -1988,13 +2191,17 @@ def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = 
     for result in additional_results:
         if result.status in [NTPStatus.ERROR, NTPStatus.TIMEOUT, NTPStatus.UNSYNCHRONIZED, NTPStatus.UNREACHABLE]:
             additional_error_results.append(result)
+        elif result.kerberos_status and result.kerberos_status not in ('OK', None, ''):
+            additional_error_results.append(result)
+        elif result.dns_status and result.dns_status not in ('OK', None, ''):
+            additional_error_results.append(result)
         elif result.delta_seconds is not None:
             additional_results_with_delta.append(result)
         else:
             additional_results_without_delta.append(result)
 
     # Sort additional servers the same way as primary servers
-    additional_error_results.sort(key=lambda x: status_priority.get(x.status, 5))
+    additional_error_results.sort(key=_error_sort_key)
     additional_results_with_delta.sort(key=lambda x: abs(x.delta_seconds), reverse=True)
 
     # Combine: primary servers first (errors, then by variance), then additional servers at bottom
@@ -2060,6 +2267,8 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             'Reference ID',            # Upstream time source (GPS/PPS for stratum 1, IP for 2+)
             'Reference Time (UTC)',    # When server clock was last set/corrected
             'Poll Interval (s)',       # Poll interval in seconds (2^poll)
+            'Kerberos KDC',            # Kerberos KDC check result (OK, NO_RESPONSE, NOT_KDC)
+            'DNS Service',             # DNS service check result (OK, NO_RESPONSE, INVALID)
             'Status',                  # Query status (OK, TIMEOUT, ERROR, etc.)
             'Error Message'            # Error details for failed queries
         ]
@@ -2104,6 +2313,8 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
                 result.ref_id or '',
                 result.ref_time.isoformat() if result.ref_time else '',
                 2 ** result.poll_interval if result.poll_interval is not None else '',
+                result.kerberos_status or '',
+                result.dns_status or '',
                 result.status.value,
                 result.error_message or ''
             ]
@@ -2140,7 +2351,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             worksheet.column_dimensions[column_letter].width = adjusted_width
 
         # Apply status column and variance highlighting - DIRECT APPROACH ONLY
-        status_col = 17  # Status column (after adding Leap, Precision, RefID, RefTime, Poll)
+        status_col = 19  # Status column (after adding DNS Service column)
         delta_col = 10   # Delta Value column
         variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
 
@@ -2161,6 +2372,30 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             elif status_cell.value == 'UNREACHABLE':
                 status_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
                 status_cell.font = Font(bold=True)
+
+            # Kerberos KDC column formatting (column 17)
+            krb_cell = worksheet.cell(row=row_num, column=17)
+            if krb_cell.value == 'OK':
+                krb_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                krb_cell.font = Font(bold=True)
+            elif krb_cell.value in ['NO_RESPONSE', 'KRB_ONLY', 'NOT_KDC']:
+                krb_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                krb_cell.font = Font(bold=True)
+            elif krb_cell.value and str(krb_cell.value).startswith('ERROR'):
+                krb_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                krb_cell.font = Font(bold=True)
+
+            # DNS Service column formatting (column 18)
+            dns_cell = worksheet.cell(row=row_num, column=18)
+            if dns_cell.value == 'OK':
+                dns_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                dns_cell.font = Font(bold=True)
+            elif dns_cell.value in ['NO_RESPONSE', 'INVALID']:
+                dns_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                dns_cell.font = Font(bold=True)
+            elif dns_cell.value and str(dns_cell.value).startswith('ERROR'):
+                dns_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                dns_cell.font = Font(bold=True)
 
             # Delta Value column variance highlighting - DIRECT FORMATTING ONLY
             delta_cell = worksheet.cell(row=row_num, column=delta_col)
@@ -2513,6 +2748,18 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         if stats.failed_servers > 0:
             has_error = True
 
+        # Check for Kerberos and DNS failures across primary servers only
+        krb_fail_count = 0
+        dns_fail_count = 0
+        for result in primary_results:
+            if result.kerberos_status and result.kerberos_status not in ('OK', None, ''):
+                krb_fail_count += 1
+            if result.dns_status and result.dns_status not in ('OK', None, ''):
+                dns_fail_count += 1
+
+        if krb_fail_count > 0 or dns_fail_count > 0:
+            has_error = True
+
         # Generate subject line
         domain_name = ini_config.get('default_discovery_domain', 'unknown')
         failed_count = stats.failed_servers
@@ -2537,11 +2784,19 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
                 max_delta_str = "N/A"
             delta_section = f"Max DC Delta: {max_delta_str}"
 
-        # Format server status for subject
-        if failed_count == 0:
-            server_status = "all Domain Controllers responding"
+        # Build service failure details for subject
+        service_issues = []
+        if failed_count > 0:
+            service_issues.append(f"{failed_count} NTP")
+        if krb_fail_count > 0:
+            service_issues.append(f"{krb_fail_count} KRB")
+        if dns_fail_count > 0:
+            service_issues.append(f"{dns_fail_count} DNS")
+
+        if service_issues:
+            server_status = f"failures: {', '.join(service_issues)}"
         else:
-            server_status = f"{failed_count} Domain Controllers not responding"
+            server_status = "all Domain Controllers responding"
 
         subject = f"{subject_prefix} {domain_name} - {delta_section} - {server_status}"
 
@@ -2719,18 +2974,35 @@ def main():
                 if additional_servers_with_counts:
                     logger.info(f"Loaded {len(additional_servers_with_counts)} additional NTP servers for monitoring")
 
-                    # Create tracking dictionaries for all counters
-                    failure_counts = {server: failure_count for server, _, failure_count, _, _, _, _ in additional_servers_with_counts}
-                    missed_counts = {server: missed for server, _, _, missed, _, _, _ in additional_servers_with_counts}
-                    failed_statuses = {server: failed for server, _, _, _, failed, _, _ in additional_servers_with_counts}
-                    time_counts = {server: time for server, _, _, _, _, _, time in additional_servers_with_counts}
+                    # Filter out servers that have exceeded the skip threshold
+                    if config.skip_threshold > 0:
+                        active_servers = []
+                        skipped_servers = []
+                        for entry in additional_servers_with_counts:
+                            server, short_name, failure_count = entry[0], entry[1], entry[2]
+                            if failure_count >= config.skip_threshold:
+                                skipped_servers.append(entry)
+                                logger.info(f"Skipping server {server} ({short_name}): failure_count={failure_count} >= threshold={config.skip_threshold}")
+                            else:
+                                active_servers.append(entry)
+                        if skipped_servers:
+                            logger.info(f"Skipped {len(skipped_servers)} servers exceeding failure threshold ({config.skip_threshold})")
+                        servers_to_process = active_servers
+                    else:
+                        servers_to_process = additional_servers_with_counts
+
+                    # Create tracking dictionaries for active servers only
+                    failure_counts = {server: failure_count for server, _, failure_count, _, _, _, _ in servers_to_process}
+                    missed_counts = {server: missed for server, _, _, missed, _, _, _ in servers_to_process}
+                    failed_statuses = {server: failed for server, _, _, _, failed, _, _ in servers_to_process}
+                    time_counts = {server: time for server, _, _, _, _, _, time in servers_to_process}
                     logger.debug(f"Initialized tracking for {len(failure_counts)} servers")
 
                     # Process servers (pass tuples of server, short_name for processing)
-                    additional_servers_for_processing = [(server, short_name) for server, short_name, _, _, _, _, _ in additional_servers_with_counts]
+                    additional_servers_for_processing = [(server, short_name) for server, short_name, _, _, _, _, _ in servers_to_process]
                     additional_results = process_servers_parallel(additional_servers_for_processing, config.reference_ntp, config, ini_config, is_additional_servers=True, failure_counts=failure_counts, missed_counts=missed_counts, failed_statuses=failed_statuses, time_counts=time_counts)
                     results.extend(additional_results)
-                    logger.info(f"Combined results: {len(results)} total servers ({len(ntp_servers)} primary + {len(additional_servers_with_counts)} additional)")
+                    logger.info(f"Combined results: {len(results)} total servers ({len(ntp_servers)} primary + {len(servers_to_process)} additional, {len(additional_servers_with_counts) - len(servers_to_process)} skipped)")
                 else:
                     logger.warning(f"No additional servers found in {config.additional_servers_file}")
             except Exception as e:
