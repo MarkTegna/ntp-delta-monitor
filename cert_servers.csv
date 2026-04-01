@@ -1,0 +1,6 @@
+server,port,short_name
+wfaa-oasis01,443,WFAA-OASIS01
+www.google.com,443,Google
+www.github.com,443,GitHub
+expired.badssl.com,443,BadSSL-Expired
+www.microsoft.com,443,Microsoft

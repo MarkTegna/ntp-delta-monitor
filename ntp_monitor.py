@@ -11,6 +11,7 @@ import logging
 import os
 import smtplib
 import socket
+import ssl
 import statistics
 import struct
 import sys
@@ -32,7 +33,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -129,6 +130,9 @@ class NTPResult:
     poll_interval: Optional[int] = None  # Poll interval as power of 2 seconds
     kerberos_status: Optional[str] = None  # Kerberos KDC check result
     dns_status: Optional[str] = None  # DNS service check result
+    ldap_status: Optional[str] = None  # LDAP service check result (port 389)
+    ldaps_status: Optional[str] = None  # LDAPS service check result (port 636)
+    ldaps_cert_expiry: Optional[str] = None  # LDAPS certificate expiration date
 
 
 @dataclass
@@ -843,6 +847,194 @@ def check_dns_service(host: str, timeout: int = 5) -> str:
         return f'ERROR: {e}'
 
 
+def check_ldap_service(host: str, timeout: int = 5) -> str:
+    """
+    Check if LDAP service is responding on port 389 by sending an anonymous bind
+    request and verifying a valid LDAP BindResponse is returned.
+
+    Args:
+        host: Hostname or IP address to check
+        timeout: Connection timeout in seconds
+
+    Returns:
+        'OK' if LDAP responded with valid data, 'NO_RESPONSE' if unreachable, 'ERROR: ...' otherwise
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, 389))
+
+        # Anonymous LDAP Simple Bind Request (RFC 4511)
+        bind_request = bytes([
+            0x30, 0x0c,              # SEQUENCE (12 bytes)
+            0x02, 0x01, 0x01,        # INTEGER MessageID = 1
+            0x60, 0x07,              # APPLICATION 0 (BindRequest) (7 bytes)
+            0x02, 0x01, 0x03,        # INTEGER version = 3
+            0x04, 0x00,              # OCTET STRING name = ""
+            0x80, 0x00               # CONTEXT 0 (simple auth) = ""
+        ])
+
+        sock.sendall(bind_request)
+        resp = sock.recv(4096)
+        sock.close()
+
+        if resp and len(resp) > 5:
+            logger.debug(f"LDAP {host}: responded with {len(resp)} bytes")
+            return 'OK'
+
+        logger.debug(f"LDAP {host}: empty or short response")
+        return 'NO_RESPONSE'
+
+    except socket.timeout:
+        logger.debug(f"LDAP {host}: connection timed out")
+        return 'NO_RESPONSE'
+    except ConnectionRefusedError:
+        logger.debug(f"LDAP {host}: connection refused (port 389 closed)")
+        return 'NO_RESPONSE'
+    except OSError as e:
+        logger.debug(f"LDAP {host}: connection error: {e}")
+        return 'NO_RESPONSE'
+    except Exception as e:
+        logger.debug(f"LDAP {host}: unexpected error: {e}")
+        return f'ERROR: {e}'
+
+
+def check_ldaps_service(host: str, timeout: int = 5) -> tuple[str, Optional[str]]:
+    """
+    Check if LDAPS service is responding on port 636 by performing a TLS handshake
+    and extracting the certificate expiration date.
+
+    Args:
+        host: Hostname or IP address to check
+        timeout: Connection timeout in seconds
+
+    Returns:
+        Tuple of (status, cert_expiry_str):
+        - status: 'OK', 'NO_RESPONSE', or 'ERROR: ...'
+        - cert_expiry_str: Certificate expiry date as 'YYYY-MM-DD' string, or None
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        ssl_sock = ctx.wrap_socket(sock, server_hostname=host)
+        ssl_sock.connect((host, 636))
+
+        # Extract certificate expiry from DER
+        cert_expiry = None
+        try:
+            cert_der = ssl_sock.getpeercert(binary_form=True)
+            if cert_der:
+                cert_expiry = _parse_cert_expiry_from_der(cert_der)
+        except Exception as e:
+            logger.debug(f"LDAPS {host}: cert parsing error: {e}")
+
+        ssl_sock.close()
+        logger.debug(f"LDAPS {host}: TLS handshake OK, cert expiry: {cert_expiry}")
+        return 'OK', cert_expiry
+
+    except socket.timeout:
+        logger.debug(f"LDAPS {host}: connection timed out")
+        return 'NO_RESPONSE', None
+    except ConnectionRefusedError:
+        logger.debug(f"LDAPS {host}: connection refused (port 636 closed)")
+        return 'NO_RESPONSE', None
+    except ssl.SSLError as e:
+        logger.debug(f"LDAPS {host}: SSL error: {e}")
+        return 'NO_RESPONSE', None
+    except OSError as e:
+        logger.debug(f"LDAPS {host}: connection error: {e}")
+        return 'NO_RESPONSE', None
+    except Exception as e:
+        logger.debug(f"LDAPS {host}: unexpected error: {e}")
+        return f'ERROR: {e}', None
+
+
+def _parse_cert_expiry_from_der(der_bytes: bytes) -> Optional[str]:
+    """
+    Parse certificate expiry date from DER-encoded certificate bytes.
+    Walks the ASN.1 structure to find the Validity sequence and extract notAfter.
+
+    Returns expiry as 'YYYY-MM-DD' string, or None if parsing fails.
+    """
+    try:
+        def _read_tag_len(data, offset):
+            """Read ASN.1 tag and length, return (tag, length, header_size)."""
+            if offset >= len(data):
+                return None, 0, 0
+            tag = data[offset]
+            if offset + 1 >= len(data):
+                return tag, 0, 1
+            length_byte = data[offset + 1]
+            if length_byte < 0x80:
+                return tag, length_byte, 2
+            num_bytes = length_byte & 0x7f
+            if offset + 2 + num_bytes > len(data):
+                return tag, 0, 2
+            length = int.from_bytes(data[offset + 2:offset + 2 + num_bytes], 'big')
+            return tag, length, 2 + num_bytes
+
+        def _parse_time(data, offset):
+            """Parse a UTCTime or GeneralizedTime at offset, return 'YYYY-MM-DD' or None."""
+            tag, length, hdr = _read_tag_len(data, offset)
+            if tag not in (0x17, 0x18) or length == 0:
+                return None
+            time_str = data[offset + hdr:offset + hdr + length].decode('ascii')
+            if tag == 0x17:  # UTCTime: YYMMDDHHMMSSZ
+                year = int(time_str[:2])
+                year += 2000 if year < 50 else 1900
+                return f"{year:04d}-{int(time_str[2:4]):02d}-{int(time_str[4:6]):02d}"
+            else:  # GeneralizedTime: YYYYMMDDHHMMSSZ
+                return f"{int(time_str[:4]):04d}-{int(time_str[4:6]):02d}-{int(time_str[6:8]):02d}"
+
+        # Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+        tag, cert_len, hdr = _read_tag_len(der_bytes, 0)
+        if tag != 0x30:
+            return None
+
+        # TBSCertificate ::= SEQUENCE { ... }
+        tbs_offset = hdr
+        tag, tbs_len, tbs_hdr = _read_tag_len(der_bytes, tbs_offset)
+        if tag != 0x30:
+            return None
+
+        # Walk through TBSCertificate fields to find Validity (5th field typically)
+        pos = tbs_offset + tbs_hdr
+        tbs_end = tbs_offset + tbs_hdr + tbs_len
+
+        # Skip: version [0] EXPLICIT (optional), serialNumber, signature, issuer
+        fields_skipped = 0
+        while pos < tbs_end and fields_skipped < 4:
+            tag, length, field_hdr = _read_tag_len(der_bytes, pos)
+            if tag is None:
+                break
+            pos += field_hdr + length
+            fields_skipped += 1
+
+        # Now pos should be at Validity ::= SEQUENCE { notBefore, notAfter }
+        if pos >= tbs_end:
+            return None
+        tag, val_len, val_hdr = _read_tag_len(der_bytes, pos)
+        if tag != 0x30:
+            return None
+
+        # Skip notBefore, read notAfter
+        nb_offset = pos + val_hdr
+        nb_tag, nb_len, nb_hdr = _read_tag_len(der_bytes, nb_offset)
+        na_offset = nb_offset + nb_hdr + nb_len
+        return _parse_time(der_bytes, na_offset)
+
+    except Exception:
+        return None
+
+
 def parse_server_file(file_path: Path) -> List[str]:
     """
     Auto-detect format and parse server list from TXT or CSV files.
@@ -1440,10 +1632,15 @@ def process_single_server(server: str, reference_offset: float, reference_query_
     # Check Kerberos KDC and DNS service status (primary servers only, not additional)
     kerberos_status = None
     dns_status = None
+    ldap_status = None
+    ldaps_status = None
+    ldaps_cert_expiry = None
     if not is_additional_server:
         check_target = resolved_ip if resolved_ip else server
         kerberos_status = check_kerberos_kdc(check_target, timeout=min(config.ntp_timeout, 5))
         dns_status = check_dns_service(check_target, timeout=min(config.ntp_timeout, 5))
+        ldap_status = check_ldap_service(check_target, timeout=min(config.ntp_timeout, 5))
+        ldaps_status, ldaps_cert_expiry = check_ldaps_service(check_target, timeout=min(config.ntp_timeout, 5))
 
     try:
         # Query the NTP server
@@ -1498,7 +1695,10 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             ref_time=ntp_response.ref_time,
             poll_interval=ntp_response.poll_interval,
             kerberos_status=kerberos_status,
-            dns_status=dns_status
+            dns_status=dns_status,
+            ldap_status=ldap_status,
+            ldaps_status=ldaps_status,
+            ldaps_cert_expiry=ldaps_cert_expiry
         )
 
     except Exception as e:
@@ -1539,7 +1739,10 @@ def process_single_server(server: str, reference_offset: float, reference_query_
             failed=updated_failed,
             time=updated_time,
             kerberos_status=kerberos_status,
-            dns_status=dns_status
+            dns_status=dns_status,
+            ldap_status=ldap_status,
+            ldaps_status=ldaps_status,
+            ldaps_cert_expiry=ldaps_cert_expiry
         )
 
 
@@ -2161,6 +2364,10 @@ def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = 
             primary_error_results.append(result)
         elif result.dns_status and result.dns_status not in ('OK', None, ''):
             primary_error_results.append(result)
+        elif result.ldap_status and result.ldap_status not in ('OK', None, ''):
+            primary_error_results.append(result)
+        elif result.ldaps_status and result.ldaps_status not in ('OK', None, ''):
+            primary_error_results.append(result)
         elif result.delta_seconds is not None:
             primary_results_with_delta.append(result)
         else:
@@ -2194,6 +2401,10 @@ def sort_results_by_variance(results: List[NTPResult], sort_by_variance: bool = 
         elif result.kerberos_status and result.kerberos_status not in ('OK', None, ''):
             additional_error_results.append(result)
         elif result.dns_status and result.dns_status not in ('OK', None, ''):
+            additional_error_results.append(result)
+        elif result.ldap_status and result.ldap_status not in ('OK', None, ''):
+            additional_error_results.append(result)
+        elif result.ldaps_status and result.ldaps_status not in ('OK', None, ''):
             additional_error_results.append(result)
         elif result.delta_seconds is not None:
             additional_results_with_delta.append(result)
@@ -2269,6 +2480,9 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             'Poll Interval (s)',       # Poll interval in seconds (2^poll)
             'Kerberos KDC',            # Kerberos KDC check result (OK, NO_RESPONSE, NOT_KDC)
             'DNS Service',             # DNS service check result (OK, NO_RESPONSE, INVALID)
+            'LDAP',                    # LDAP service check result (port 389)
+            'LDAPS',                   # LDAPS service check result (port 636)
+            'LDAPS Cert Expiry',       # LDAPS certificate expiration date
             'Status',                  # Query status (OK, TIMEOUT, ERROR, etc.)
             'Error Message'            # Error details for failed queries
         ]
@@ -2315,6 +2529,9 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
                 2 ** result.poll_interval if result.poll_interval is not None else '',
                 result.kerberos_status or '',
                 result.dns_status or '',
+                result.ldap_status or '',
+                result.ldaps_status or '',
+                result.ldaps_cert_expiry or '',
                 result.status.value,
                 result.error_message or ''
             ]
@@ -2351,7 +2568,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             worksheet.column_dimensions[column_letter].width = adjusted_width
 
         # Apply status column and variance highlighting - DIRECT APPROACH ONLY
-        status_col = 19  # Status column (after adding DNS Service column)
+        status_col = 22  # Status column (after adding LDAP, LDAPS, LDAPS Cert Expiry)
         delta_col = 10   # Delta Value column
         variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
 
@@ -2396,6 +2613,24 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             elif dns_cell.value and str(dns_cell.value).startswith('ERROR'):
                 dns_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
                 dns_cell.font = Font(bold=True)
+
+            # LDAP column formatting (column 19)
+            ldap_cell = worksheet.cell(row=row_num, column=19)
+            if ldap_cell.value == 'OK':
+                ldap_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                ldap_cell.font = Font(bold=True)
+            elif ldap_cell.value and ldap_cell.value != '':
+                ldap_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                ldap_cell.font = Font(bold=True)
+
+            # LDAPS column formatting (column 20)
+            ldaps_cell = worksheet.cell(row=row_num, column=20)
+            if ldaps_cell.value == 'OK':
+                ldaps_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                ldaps_cell.font = Font(bold=True)
+            elif ldaps_cell.value and ldaps_cell.value != '':
+                ldaps_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                ldaps_cell.font = Font(bold=True)
 
             # Delta Value column variance highlighting - DIRECT FORMATTING ONLY
             delta_cell = worksheet.cell(row=row_num, column=delta_col)
@@ -2751,13 +2986,19 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
         # Check for Kerberos and DNS failures across primary servers only
         krb_fail_count = 0
         dns_fail_count = 0
+        ldap_fail_count = 0
+        ldaps_fail_count = 0
         for result in primary_results:
             if result.kerberos_status and result.kerberos_status not in ('OK', None, ''):
                 krb_fail_count += 1
             if result.dns_status and result.dns_status not in ('OK', None, ''):
                 dns_fail_count += 1
+            if result.ldap_status and result.ldap_status not in ('OK', None, ''):
+                ldap_fail_count += 1
+            if result.ldaps_status and result.ldaps_status not in ('OK', None, ''):
+                ldaps_fail_count += 1
 
-        if krb_fail_count > 0 or dns_fail_count > 0:
+        if krb_fail_count > 0 or dns_fail_count > 0 or ldap_fail_count > 0 or ldaps_fail_count > 0:
             has_error = True
 
         # Generate subject line
@@ -2792,6 +3033,10 @@ def send_email_notification(summary_text: str, xlsx_path: Path, txt_path: Path, 
             service_issues.append(f"{krb_fail_count} KRB")
         if dns_fail_count > 0:
             service_issues.append(f"{dns_fail_count} DNS")
+        if ldap_fail_count > 0:
+            service_issues.append(f"{ldap_fail_count} LDAP")
+        if ldaps_fail_count > 0:
+            service_issues.append(f"{ldaps_fail_count} LDAPS")
 
         if service_issues:
             server_status = f"failures: {', '.join(service_issues)}"
