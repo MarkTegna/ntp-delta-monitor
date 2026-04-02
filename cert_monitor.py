@@ -30,7 +30,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.0.1"
+VERSION = "0.0.3"
 PROGRAM_NAME = "Certificate Expiry Monitor"
 
 
@@ -697,8 +697,8 @@ CSV Format:
     10.0.0.1,,Web Server
         """)
 
-    parser.add_argument('-s', '--servers-file', type=Path, required=True, metavar='FILE',
-                        help='Path to CSV file with server list (required)')
+    parser.add_argument('-s', '--servers-file', type=Path, metavar='FILE',
+                        help='Path to CSV file with server list (default: cert_servers.csv in current directory)')
     parser.add_argument('-o', '--output-file', type=Path, metavar='FILE',
                         help='Output XLSX file path (default: auto-generated with timestamp)')
     parser.add_argument('-p', '--parallel-limit', type=int,
@@ -720,11 +720,18 @@ CSV Format:
 
     args = parser.parse_args()
 
-    if not args.servers_file.exists():
-        parser.error(f"Servers file not found: {args.servers_file}")
+    # Default to cert_servers.csv if not specified
+    servers_file = args.servers_file
+    if servers_file is None:
+        servers_file = Path('cert_servers.csv')
+        if not servers_file.exists():
+            parser.error("No servers file specified and cert_servers.csv not found in current directory")
+
+    if not servers_file.exists():
+        parser.error(f"Servers file not found: {servers_file}")
 
     return Config(
-        servers_file=args.servers_file,
+        servers_file=servers_file,
         output_file=args.output_file,
         parallel_limit=args.parallel_limit,
         timeout=args.timeout,
