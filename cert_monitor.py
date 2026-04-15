@@ -30,7 +30,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.0.3"
+VERSION = "0.0.5"
 PROGRAM_NAME = "Certificate Expiry Monitor"
 
 
@@ -60,6 +60,8 @@ class Config:
     warning_days: int  # Days before expiry to flag as warning
     critical_days: int  # Days before expiry to flag as critical
     verbose: bool
+    filter_days: int = 30  # Default filter: show Days Remaining < this value
+    filter_issuers: str = ''  # Comma-separated issuer substrings to filter on
 
 
 def _parse_cert_expiry_from_der(der_bytes: bytes) -> Optional[str]:
@@ -491,6 +493,69 @@ def write_xlsx_report(results: List[CertResult], output_path: Path, config: Conf
                     pass
             ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
+        # Freeze top row and enable auto-filter on all columns
+        ws.freeze_panes = 'A2'
+        ws.auto_filter.ref = ws.dimensions
+
+        # Apply column filters using openpyxl's FilterColumn API
+        # These are real Excel filters the user can see and modify
+        from openpyxl.worksheet.filters import FilterColumn, CustomFilter, CustomFilters, Filters
+
+        filter_days = config.filter_days
+        filter_issuer_list = [s.strip() for s in config.filter_issuers.split(',') if s.strip()]
+
+        # Days Remaining filter (column 7, index 6): custom filter < filter_days
+        days_filter = CustomFilters(customFilter=[
+            CustomFilter(operator='lessThan', val=str(filter_days))
+        ])
+        ws.auto_filter.filterColumn.append(
+            FilterColumn(colId=6, customFilters=days_filter)
+        )
+
+        # Issuer filter (column 9, index 8): show only rows matching configured issuer substrings
+        # Collect unique issuer values from data that match the configured substrings
+        if filter_issuer_list:
+            matching_issuers = set()
+            for row_num in range(2, len(results) + 2):
+                cell_val = ws.cell(row=row_num, column=9).value
+                if cell_val:
+                    cell_lower = str(cell_val).lower()
+                    if any(f.lower() in cell_lower for f in filter_issuer_list):
+                        matching_issuers.add(str(cell_val))
+
+            if matching_issuers:
+                issuer_filter = Filters(blank=False, filter=sorted(matching_issuers))
+                ws.auto_filter.filterColumn.append(
+                    FilterColumn(colId=8, filters=issuer_filter)
+                )
+
+        # Hide rows that don't match the filters (Excel auto-filter hides rows visually)
+        for row_num in range(2, len(results) + 2):
+            days_val = ws.cell(row=row_num, column=7).value
+            issuer_val = ws.cell(row=row_num, column=9).value
+
+            # Check days filter
+            days_visible = True
+            if days_val is None or days_val == '' or not isinstance(days_val, (int, float)):
+                days_visible = False
+            elif days_val >= filter_days:
+                days_visible = False
+
+            # Check issuer filter
+            issuer_visible = True
+            if filter_issuer_list:
+                if not issuer_val or issuer_val == '':
+                    issuer_visible = False
+                else:
+                    issuer_lower = str(issuer_val).lower()
+                    issuer_visible = any(f.lower() in issuer_lower for f in filter_issuer_list)
+
+            # Hide row if it doesn't match both filters
+            if not (days_visible and issuer_visible):
+                ws.row_dimensions[row_num].hidden = True
+
+        logger.info(f"Applied filters: Days Remaining < {filter_days}, Issuers: {config.filter_issuers}")
+
         workbook.save(output_path)
         logger.info(f"Wrote {len(results)} results to {output_path}")
 
@@ -618,6 +683,8 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
         'default_timeout': 10,
         'warning_days': 30,
         'critical_days': 7,
+        'filter_days': 30,
+        'filter_issuers': 'Tegna SHA2 Issuing CA 01,Tegna Inc. Issuing',
         'output_directory': '.\\Reports',
         'send_email': False,
         'smtp_server': '',
@@ -641,6 +708,8 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
                 defaults['default_timeout'] = s.getint('default_timeout', defaults['default_timeout'])
                 defaults['warning_days'] = s.getint('warning_days', defaults['warning_days'])
                 defaults['critical_days'] = s.getint('critical_days', defaults['critical_days'])
+                defaults['filter_days'] = s.getint('filter_days', defaults['filter_days'])
+                defaults['filter_issuers'] = s.get('filter_issuers', defaults['filter_issuers'])
                 defaults['output_directory'] = s.get('output_directory', defaults['output_directory'])
 
             if 'email_settings' in config:
@@ -737,7 +806,9 @@ CSV Format:
         timeout=args.timeout,
         warning_days=args.warning_days,
         critical_days=args.critical_days,
-        verbose=args.verbose
+        verbose=args.verbose,
+        filter_days=ini_config['filter_days'],
+        filter_issuers=ini_config['filter_issuers']
     )
 
 

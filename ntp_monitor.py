@@ -33,7 +33,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
