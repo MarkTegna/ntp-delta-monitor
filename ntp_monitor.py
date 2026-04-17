@@ -33,7 +33,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -1400,7 +1400,7 @@ def get_all_domain_ips(domain: str, timeout: int = 10) -> List[str]:
 
         logger.info(f"Querying all A records for domain: {domain}")
 
-        # Get all A records for the domain
+        # Get all A records for the domain (try UDP first, fall back to TCP for large record sets)
         try:
             answers = resolver.resolve(domain, 'A')
 
@@ -1412,9 +1412,17 @@ def get_all_domain_ips(domain: str, timeout: int = 10) -> List[str]:
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as e:
             logger.warning(f"No A records found for domain {domain}: {e}")
             return []
-        except dns.resolver.Timeout:
-            logger.warning(f"DNS query timeout for domain {domain}")
-            return []
+        except (dns.resolver.Timeout, dns.exception.Timeout) as e:
+            logger.warning(f"DNS UDP query timeout for {domain}, trying TCP")
+            try:
+                answers = resolver.resolve(domain, 'A', tcp=True)
+                for rdata in answers:
+                    ip = str(rdata)
+                    ip_addresses.append(ip)
+                    logger.debug(f"Found A record (TCP): {domain} -> {ip}")
+            except Exception as e2:
+                logger.warning(f"DNS TCP query also failed for {domain}: {e2}")
+                return []
         except Exception as e:
             logger.error(f"DNS query error for domain {domain}: {e}")
             return []
@@ -2483,6 +2491,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             'LDAP',                    # LDAP service check result (port 389)
             'LDAPS',                   # LDAPS service check result (port 636)
             'LDAPS Cert Expiry',       # LDAPS certificate expiration date
+            'Failure Count',           # Consecutive failure count for this server
             'Status',                  # Query status (OK, TIMEOUT, ERROR, etc.)
             'Error Message'            # Error details for failed queries
         ]
@@ -2532,6 +2541,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
                 result.ldap_status or '',
                 result.ldaps_status or '',
                 result.ldaps_cert_expiry or '',
+                result.failure_count,
                 result.status.value,
                 result.error_message or ''
             ]
@@ -2568,7 +2578,7 @@ def write_xlsx_report(results: List[NTPResult], output_path: Path, config: Confi
             worksheet.column_dimensions[column_letter].width = adjusted_width
 
         # Apply status column and variance highlighting - DIRECT APPROACH ONLY
-        status_col = 22  # Status column (after adding LDAP, LDAPS, LDAPS Cert Expiry)
+        status_col = 23  # Status column (after adding Failure Count column)
         delta_col = 10   # Delta Value column
         variance_threshold_ms = ini_config.get('variance_threshold_ms', 33)
 
@@ -3169,20 +3179,52 @@ def main():
         if config.verbose:
             logger.info("Configuration validation completed successfully")
 
-        # Validate reference server is accessible (but don't store time to avoid drift)
-        logger.info(f"Validating reference NTP server: {config.reference_ntp}")
-        try:
-            test_response = query_ntp_server(config.reference_ntp, config.ntp_timeout)
-            status, error_message = validate_ntp_response(test_response)
-            if status != NTPStatus.OK:
-                logger.error(f"Reference NTP server failed validation: {error_message}")
-                logger.error("Cannot proceed without valid reference server")
-                sys.exit(1)
-            logger.info(f"Reference server validation successful: stratum {test_response.stratum}")
-        except Exception as e:
-            logger.error(f"Failed to validate reference NTP server {config.reference_ntp}: {e}")
-            logger.error("Cannot proceed without accessible reference server")
+        # Validate reference server is accessible, try fallbacks if primary fails
+        reference_ntp = config.reference_ntp
+        logger.info(f"Validating reference NTP server: {reference_ntp}")
+        reference_validated = False
+
+        # Build list of servers to try: primary first, then fallbacks, then public NTP servers
+        servers_to_try = [reference_ntp]
+        for fallback in ini_config.get('fallback_servers', []):
+            if fallback not in servers_to_try:
+                servers_to_try.append(fallback)
+        # Always include public NTP servers as last resort
+        for public in ['time.cloudflare.com', 'time.google.com', 'time.aws.com', 'time.windows.com']:
+            if public not in servers_to_try:
+                servers_to_try.append(public)
+
+        for candidate in servers_to_try:
+            try:
+                logger.info(f"Trying reference server: {candidate}")
+                test_response = query_ntp_server(candidate, config.ntp_timeout)
+                status, error_message = validate_ntp_response(test_response)
+                if status == NTPStatus.OK:
+                    reference_ntp = candidate
+                    reference_validated = True
+                    logger.info(f"Reference server validation successful: {candidate} (stratum {test_response.stratum})")
+                    break
+                else:
+                    logger.warning(f"Reference server {candidate} failed validation: {error_message}")
+            except Exception as e:
+                logger.warning(f"Reference server {candidate} unreachable: {e}")
+
+        if not reference_validated:
+            logger.error("All reference servers failed - cannot proceed")
             sys.exit(1)
+
+        # Update config with the working reference server
+        config = Config(
+            reference_ntp=reference_ntp,
+            ntp_servers_file=config.ntp_servers_file,
+            additional_servers_file=config.additional_servers_file,
+            output_file=config.output_file,
+            format_type=config.format_type,
+            parallel_limit=config.parallel_limit,
+            ntp_timeout=config.ntp_timeout,
+            verbose=config.verbose,
+            skip_threshold=config.skip_threshold
+        )
 
         # Parse NTP server list from file or auto-discover
         if config.ntp_servers_file:
