@@ -34,7 +34,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 PROGRAM_NAME = "DNS Response Monitor"
 
 
@@ -364,14 +364,15 @@ def write_xlsx_report(results: dict, output_path: Path, config: Config, ini_conf
         threshold = config.variance_threshold_ms
 
         def _sort_key(r):
+            name = (r.short_name or r.server or '').lower()
             if r.failure_rate >= 1.0:
-                return (0, 0)  # FAILED first
+                return (0, name)  # FAILED first, alpha
             elif r.failure_rate > 0:
-                return (1, -r.failure_rate)  # DEGRADED next, worst first
+                return (1, name)  # DEGRADED next, alpha
             elif r.avg_ms and r.avg_ms > threshold:
-                return (2, -(r.avg_ms or 0))  # SLOW next, slowest first
+                return (2, name)  # SLOW next, alpha
             else:
-                return (3, -(r.avg_ms or 0))  # OK last
+                return (3, name)  # OK last, alpha
 
         sorted_results = sorted(results.values(), key=_sort_key)
 
