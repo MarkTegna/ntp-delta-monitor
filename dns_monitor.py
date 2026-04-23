@@ -34,7 +34,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.0.1"
+VERSION = "0.1.0"
 PROGRAM_NAME = "DNS Response Monitor"
 
 
@@ -82,6 +82,7 @@ class Config:
     parallel_limit: int
     verbose: bool
     variance_threshold_ms: float  # Flag servers with avg response > this
+    skip_after_failures: int = 5  # Stop querying a server after this many consecutive failures
 
 
 def query_dns_server(server_ip: str, query_domain: str, timeout: int = 5) -> tuple[Optional[float], str, Optional[str]]:
@@ -236,15 +237,18 @@ def parse_additional_servers_csv(file_path: Path) -> List[tuple[str, str]]:
 def run_iterations(servers: list, config: Config, ini_config: dict) -> dict:
     """
     Run DNS queries against all servers for the configured number of iterations.
-    Queries servers in round-robin order: server1, server2, ..., serverN, server1, ...
+    Each iteration queries all active servers in parallel using a thread pool.
+    Servers that fail consecutively are removed from the active rotation.
 
     Returns dict mapping server_ip to DNSServerSummary.
     """
     logger = logging.getLogger(__name__)
     iterations = config.iterations
+    skip_threshold = config.skip_after_failures
+    max_workers = min(config.parallel_limit, len(servers))
 
     # Build server list with metadata
-    server_entries = []  # List of (ip, short_name, is_additional)
+    server_entries = []
     for item in servers:
         if isinstance(item, tuple):
             ip, short, is_additional = item
@@ -254,6 +258,9 @@ def run_iterations(servers: list, config: Config, ini_config: dict) -> dict:
 
     # Initialize results tracking
     results = {}
+    consecutive_failures = {}
+    skipped_servers = set()
+
     for ip, short, is_additional in server_entries:
         results[ip] = DNSServerSummary(
             server=ip, server_ip=ip, short_name=short,
@@ -262,35 +269,54 @@ def run_iterations(servers: list, config: Config, ini_config: dict) -> dict:
             stddev_ms=None, failure_rate=0.0, is_additional_server=is_additional,
             all_times=[], errors=[]
         )
+        consecutive_failures[ip] = 0
 
-    logger.info(f"Starting {iterations} iterations across {len(server_entries)} servers")
-    total_queries = iterations * len(server_entries)
+    logger.info(f"Starting {iterations} iterations across {len(server_entries)} servers "
+                f"({max_workers} parallel workers, skip after {skip_threshold} failures)")
     completed = 0
+    skipped_count = 0
 
-    # Round-robin: iterate through all servers, repeat for each iteration
     for iteration in range(1, iterations + 1):
+        active_entries = [(ip, short, ia) for ip, short, ia in server_entries if ip not in skipped_servers]
         if iteration % 10 == 0 or iteration == 1:
-            logger.info(f"Iteration {iteration}/{iterations}")
+            logger.info(f"Iteration {iteration}/{iterations} ({len(active_entries)} active, {len(skipped_servers)} skipped)")
 
-        for ip, short, is_additional in server_entries:
-            elapsed_ms, status, error = query_dns_server(ip, config.query_domain, config.timeout)
-            completed += 1
+        if not active_entries:
+            logger.warning(f"All servers skipped after {iteration-1} iterations")
+            break
 
-            summary = results[ip]
-            summary.total_queries += 1
+        # Query all active servers in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for ip, short, is_additional in active_entries:
+                future = executor.submit(query_dns_server, ip, config.query_domain, config.timeout)
+                futures[future] = (ip, short)
 
-            if status == 'OK' and elapsed_ms is not None:
-                summary.successful_queries += 1
-                summary.all_times.append(elapsed_ms)
-            else:
-                summary.failed_queries += 1
-                summary.errors.append(f"Iter {iteration}: {status} - {error}")
+            for future in as_completed(futures):
+                ip, short = futures[future]
+                completed += 1
+                try:
+                    elapsed_ms, status, error = future.result()
+                except Exception as e:
+                    elapsed_ms, status, error = None, 'ERROR', str(e)
 
-        # Brief pause between iterations to avoid flooding
-        if iteration < iterations:
-            time.sleep(0.05)
+                summary = results[ip]
+                summary.total_queries += 1
 
-    # Calculate statistics for each server
+                if status == 'OK' and elapsed_ms is not None:
+                    summary.successful_queries += 1
+                    summary.all_times.append(elapsed_ms)
+                    consecutive_failures[ip] = 0
+                else:
+                    summary.failed_queries += 1
+                    summary.errors.append(f"Iter {iteration}: {status} - {error}")
+                    consecutive_failures[ip] += 1
+
+                    if skip_threshold > 0 and consecutive_failures[ip] >= skip_threshold:
+                        skipped_servers.add(ip)
+                        logger.warning(f"Skipping {short} ({ip}): {skip_threshold} consecutive failures")
+
+    # Calculate statistics
     for ip, summary in results.items():
         times = summary.all_times
         if times:
@@ -304,7 +330,7 @@ def run_iterations(servers: list, config: Config, ini_config: dict) -> dict:
                 summary.stddev_ms = 0.0
         summary.failure_rate = round(summary.failed_queries / summary.total_queries, 4) if summary.total_queries > 0 else 0.0
 
-    logger.info(f"Completed {completed} total queries")
+    logger.info(f"Completed {completed} queries, {len(skipped_servers)} servers removed from rotation")
     return results
 
 
@@ -548,10 +574,11 @@ def load_configuration(config_file: str = "dns_monitor.ini") -> dict:
         'default_discovery_domain': 'tgna.tegna.com',
         'fallback_servers': ['8.8.8.8', '8.8.4.4', '1.1.1.1'],
         'default_parallel_limit': 10,
-        'default_timeout': 5,
+        'default_timeout': 2,
         'default_iterations': 100,
         'query_domain': 'ntp1.tgna.tegna.com',
         'variance_threshold_ms': 50,
+        'skip_after_failures': 5,
         'output_directory': '.\\Reports',
         'send_email': False,
         'smtp_server': '',
@@ -583,6 +610,7 @@ def load_configuration(config_file: str = "dns_monitor.ini") -> dict:
                 defaults['default_timeout'] = s.getint('default_timeout', defaults['default_timeout'])
                 defaults['default_iterations'] = s.getint('default_iterations', defaults['default_iterations'])
                 defaults['variance_threshold_ms'] = s.getfloat('variance_threshold_ms', defaults['variance_threshold_ms'])
+                defaults['skip_after_failures'] = s.getint('skip_after_failures', defaults['skip_after_failures'])
                 defaults['output_directory'] = s.get('output_directory', defaults['output_directory'])
 
             if 'email_settings' in config:
@@ -612,7 +640,13 @@ def setup_logging(verbose: bool = False) -> None:
 
 def parse_arguments() -> Config:
     """Parse CLI arguments."""
-    ini_config = load_configuration()
+    # First pass: check for --config to load the right INI file
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument('-c', '--config', type=str, default='dns_monitor.ini',
+                            help='Path to INI configuration file')
+    pre_args, _ = pre_parser.parse_known_args()
+
+    ini_config = load_configuration(pre_args.config)
 
     parser = argparse.ArgumentParser(
         description='DNS Response Monitor - Test DNS server response times',
@@ -621,6 +655,9 @@ def parse_arguments() -> Config:
 Examples:
   Default (discover DCs from {ini_config['default_discovery_domain']}):
     %(prog)s
+
+  With a different config file:
+    %(prog)s -c my_dns_monitor.ini
 
   With additional servers CSV:
     %(prog)s --additional-servers dns_servers.csv
@@ -632,6 +669,8 @@ Examples:
     %(prog)s -s servers.txt -n 200
         """)
 
+    parser.add_argument('-c', '--config', type=str, default='dns_monitor.ini', metavar='FILE',
+                        help=f'Path to INI configuration file [default: dns_monitor.ini]')
     parser.add_argument('-s', '--servers-file', type=Path, metavar='FILE',
                         help=f'Server list file (default: discover from {ini_config["default_discovery_domain"]})')
     parser.add_argument('--additional-servers', type=Path, metavar='FILE',
@@ -650,6 +689,9 @@ Examples:
                         help=f'Max concurrent workers [default: {ini_config["default_parallel_limit"]}]')
     parser.add_argument('-o', '--output-file', type=Path, metavar='FILE',
                         help='Output XLSX file path (default: auto-generated)')
+    parser.add_argument('--skip-after', type=int,
+                        default=ini_config['skip_after_failures'], metavar='N',
+                        help=f'Stop querying a server after N consecutive failures (0 to disable) [default: {ini_config["skip_after_failures"]}]')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose logging')
     parser.add_argument('--version', action='version',
@@ -673,7 +715,8 @@ Examples:
         query_domain=args.query_domain,
         parallel_limit=args.parallel_limit,
         verbose=args.verbose,
-        variance_threshold_ms=ini_config['variance_threshold_ms']
+        variance_threshold_ms=ini_config['variance_threshold_ms'],
+        skip_after_failures=args.skip_after
     )
 
 
@@ -707,10 +750,17 @@ def main():
                 logger.warning(f"No A records for {domain}, using fallback servers")
                 ips = ini_config['fallback_servers']
 
-            # Reverse DNS for short names
-            for ip in ips:
-                full, short = perform_reverse_dns(ip, domain, config.timeout)
-                all_servers.append((ip, short or ip, False))
+            # Reverse DNS for short names (parallel)
+            logger.info(f"Resolving short names for {len(ips)} servers...")
+            with ThreadPoolExecutor(max_workers=min(20, len(ips))) as executor:
+                future_to_ip = {executor.submit(perform_reverse_dns, ip, domain, config.timeout): ip for ip in ips}
+                for future in as_completed(future_to_ip):
+                    ip = future_to_ip[future]
+                    try:
+                        full, short = future.result()
+                    except Exception:
+                        full, short = None, None
+                    all_servers.append((ip, short or ip, False))
 
             logger.info(f"Discovered {len(all_servers)} primary DNS servers")
 
