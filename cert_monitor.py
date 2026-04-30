@@ -30,7 +30,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.0.5"
+VERSION = "0.1.0"
 PROGRAM_NAME = "Certificate Expiry Monitor"
 
 
@@ -578,6 +578,7 @@ def format_summary(results: List[CertResult], config: Config) -> str:
         "CERTIFICATE EXPIRY SUMMARY",
         "=" * 60,
         f"Hostname: {socket.gethostname()}",
+        f"Execution path: {os.getcwd()}",
         f"Program: {PROGRAM_NAME} v{VERSION}",
         "",
         f"Total servers checked: {total}",
