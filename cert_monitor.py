@@ -30,7 +30,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PROGRAM_NAME = "Certificate Expiry Monitor"
 
 
@@ -62,6 +62,7 @@ class Config:
     verbose: bool
     filter_days: int = 30  # Default filter: show Days Remaining < this value
     filter_issuers: str = ''  # Comma-separated issuer substrings to filter on
+    fallback_ports: List[int] = None  # Ports to try if 443 fails
 
 
 def _parse_cert_expiry_from_der(der_bytes: bytes) -> Optional[str]:
@@ -351,36 +352,74 @@ def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str]]:
         sys.exit(1)
 
 
-def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config) -> List[CertResult]:
-    """Process all servers concurrently."""
+def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config) -> tuple[List[CertResult], List[tuple[str, int, str]]]:
+    """
+    Process all servers concurrently. When port 443 fails, try all fallback ports.
+    Returns (results, new_entries) where new_entries are servers discovered on alternate ports.
+    """
     logger = logging.getLogger(__name__)
     results = []
+    new_csv_entries = []  # (server, port, short_name) for servers found on alternate ports
 
     if not servers:
-        return results
+        return results, new_csv_entries
 
     max_workers = config.parallel_limit if config.parallel_limit > 0 else 10
+    fallback_ports = config.fallback_ports or []
     logger.info(f"Processing {len(servers)} servers with {max_workers} workers")
+    if fallback_ports:
+        logger.info(f"Fallback ports if 443 fails: {fallback_ports}")
+
+    # Track which server+port combos are already in the CSV
+    existing_entries = {(s, p) for s, p, _ in servers}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_server = {}
         for server, port, short_name in servers:
             future = executor.submit(check_certificate, server, port, config.timeout, short_name)
-            future_to_server[future] = server
+            future_to_server[future] = (server, port, short_name)
 
         for future in as_completed(future_to_server):
-            server = future_to_server[future]
+            server, port, short_name = future_to_server[future]
             try:
                 result = future.result()
                 results.append(result)
             except Exception as e:
                 logger.error(f"Unexpected error for {server}: {e}")
-                results.append(CertResult(
-                    timestamp_utc=datetime.now(timezone.utc), server=server, port=443,
-                    short_name=server, server_ip=None, status='ERROR',
+                result = CertResult(
+                    timestamp_utc=datetime.now(timezone.utc), server=server, port=port,
+                    short_name=short_name, server_ip=None, status='ERROR',
                     cert_expiry=None, days_remaining=None,
                     cert_subject=None, cert_issuer=None,
-                    error_message=f'Unexpected: {e}'))
+                    error_message=f'Unexpected: {e}')
+                results.append(result)
+
+    # For servers that failed on port 443, try fallback ports
+    failed_443 = [r for r in results if r.port == 443 and r.status != 'OK']
+    if failed_443 and fallback_ports:
+        logger.info(f"Trying fallback ports for {len(failed_443)} failed servers...")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fallback_futures = {}
+            for result in failed_443:
+                for alt_port in fallback_ports:
+                    if (result.server, alt_port) not in existing_entries:
+                        future = executor.submit(check_certificate, result.server, alt_port,
+                                                 config.timeout, result.short_name)
+                        fallback_futures[future] = (result.server, alt_port, result.short_name)
+
+            for future in as_completed(fallback_futures):
+                server, alt_port, short_name = fallback_futures[future]
+                try:
+                    alt_result = future.result()
+                    if alt_result.status == 'OK':
+                        results.append(alt_result)
+                        if (server, alt_port) not in existing_entries:
+                            new_csv_entries.append((server, alt_port, short_name))
+                            existing_entries.add((server, alt_port))
+                            logger.info(f"Found cert on {server}:{alt_port} ({short_name})")
+                except Exception:
+                    pass
 
     # Sort: errors first, then by days_remaining ascending (soonest expiry first)
     def sort_key(r):
@@ -391,7 +430,7 @@ def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config
         return (2, 0)
 
     results.sort(key=sort_key)
-    return results
+    return results, new_csv_entries
 
 
 def _sanitize_xlsx(value: str) -> str:
@@ -686,6 +725,7 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
         'critical_days': 7,
         'filter_days': 30,
         'filter_issuers': 'Tegna SHA2 Issuing CA 01,Tegna Inc. Issuing',
+        'fallback_ports': '8080,8443,3389',
         'output_directory': '.\\Reports',
         'send_email': False,
         'smtp_server': '',
@@ -711,6 +751,7 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
                 defaults['critical_days'] = s.getint('critical_days', defaults['critical_days'])
                 defaults['filter_days'] = s.getint('filter_days', defaults['filter_days'])
                 defaults['filter_issuers'] = s.get('filter_issuers', defaults['filter_issuers'])
+                defaults['fallback_ports'] = s.get('fallback_ports', defaults['fallback_ports'])
                 defaults['output_directory'] = s.get('output_directory', defaults['output_directory'])
 
             if 'email_settings' in config:
@@ -809,7 +850,8 @@ CSV Format:
         critical_days=args.critical_days,
         verbose=args.verbose,
         filter_days=ini_config['filter_days'],
-        filter_issuers=ini_config['filter_issuers']
+        filter_issuers=ini_config['filter_issuers'],
+        fallback_ports=[int(p.strip()) for p in ini_config['fallback_ports'].split(',') if p.strip()]
     )
 
 
@@ -833,7 +875,18 @@ def main():
             return 1
 
         # Process servers
-        results = process_servers_parallel(servers, config)
+        results, new_csv_entries = process_servers_parallel(servers, config)
+
+        # Update CSV with newly discovered port entries
+        if new_csv_entries:
+            logger.info(f"Adding {len(new_csv_entries)} new entries to {config.servers_file}")
+            try:
+                with open(config.servers_file, 'a', newline='', encoding='utf-8') as f:
+                    for server, port, short_name in new_csv_entries:
+                        f.write(f'{server},{port},{short_name}\n')
+                logger.info(f"Updated {config.servers_file} with {len(new_csv_entries)} new port entries")
+            except Exception as e:
+                logger.error(f"Failed to update CSV: {e}")
 
         # Determine output path
         if config.output_file:
