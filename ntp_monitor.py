@@ -15,6 +15,7 @@ import ssl
 import statistics
 import struct
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 PROGRAM_NAME = "NTP Delta Monitor"
 
 
@@ -147,6 +148,7 @@ class Config:
     ntp_timeout: int
     verbose: bool
     skip_threshold: int = 10  # Skip additional servers with failure_count >= this value
+    ntp_samples: int = 3  # Number of NTP queries per server (use lowest RTT)
 
 
 @dataclass
@@ -407,6 +409,63 @@ def query_ntp_server(hostname: str, timeout: int = 30) -> NTPResponse:
     except Exception as e:
         logger.debug(f"Unexpected error querying {hostname}: {e}")
         raise Exception(f"Network error: {e}")
+
+
+def query_ntp_server_best_of(hostname: str, timeout: int = 30, samples: int = 3) -> NTPResponse:
+    """
+    Query an NTP server multiple times and return the best sample (lowest RTT).
+
+    This implements RFC 5905 best-practice: the sample with the lowest round-trip
+    delay has the least asymmetry error and therefore the most accurate offset.
+    Also uses time.perf_counter() for precise RTT measurement independent of
+    the Windows system timer resolution.
+
+    Args:
+        hostname: NTP server hostname or IP address
+        timeout: Query timeout in seconds per attempt
+        samples: Number of queries to make (default 3, uses lowest RTT)
+
+    Returns:
+        NTPResponse with the most accurate measurement (lowest RTT sample)
+
+    Raises:
+        Exception: If all sample attempts fail
+    """
+    logger = logging.getLogger(__name__)
+    best_response = None
+    best_rtt = float('inf')
+    last_error = None
+
+    for attempt in range(samples):
+        try:
+            # Use perf_counter for precise RTT measurement
+            t_before = time.perf_counter()
+            response = query_ntp_server(hostname, timeout)
+            t_after = time.perf_counter()
+
+            # Calculate precise RTT using perf_counter (microsecond resolution)
+            precise_rtt_ms = (t_after - t_before) * 1000.0
+
+            # Override ntplib's quantized RTT with our precise measurement
+            response.query_rtt_ms = round(precise_rtt_ms, 3)
+
+            if precise_rtt_ms < best_rtt:
+                best_rtt = precise_rtt_ms
+                best_response = response
+                logger.debug(f"Sample {attempt+1}/{samples} for {hostname}: RTT={precise_rtt_ms:.3f}ms (new best)")
+            else:
+                logger.debug(f"Sample {attempt+1}/{samples} for {hostname}: RTT={precise_rtt_ms:.3f}ms")
+
+        except Exception as e:
+            last_error = e
+            logger.debug(f"Sample {attempt+1}/{samples} for {hostname}: failed ({e})")
+
+    if best_response is not None:
+        logger.debug(f"Best sample for {hostname}: RTT={best_rtt:.3f}ms (from {samples} attempts)")
+        return best_response
+
+    # All attempts failed — raise the last error
+    raise last_error if last_error else Exception(f"All {samples} queries to {hostname} failed")
 
 
 def validate_ntp_response(response: NTPResponse) -> tuple[NTPStatus, Optional[str]]:
@@ -1651,9 +1710,9 @@ def process_single_server(server: str, reference_offset: float, reference_query_
         ldaps_status, ldaps_cert_expiry = check_ldaps_service(check_target, timeout=min(config.ntp_timeout, 5))
 
     try:
-        # Query the NTP server
+        # Query the NTP server (multi-sample, select lowest RTT for best accuracy)
         logger.debug(f"Querying NTP server: {server} (using {hostname_to_use})")
-        ntp_response = query_ntp_server(hostname_to_use, config.ntp_timeout)
+        ntp_response = query_ntp_server_best_of(hostname_to_use, config.ntp_timeout, samples=config.ntp_samples)
 
         # Calculate delta using NTP offsets
         # The offset from each server tells us how much that server differs from our local clock
@@ -1936,7 +1995,8 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
         'from_email': '',
         'to_email': '',
         'variance_threshold_ms': 33,
-        'skip_threshold': 10
+        'skip_threshold': 10,
+        'ntp_samples': 3
     }
 
     config = configparser.ConfigParser()
@@ -1969,6 +2029,7 @@ def load_configuration(config_file: str = "ntp_monitor.ini") -> dict:
                 defaults['sort_by_variance'] = advanced_section.getboolean('sort_by_variance', defaults['sort_by_variance'])
                 defaults['max_variance_display'] = advanced_section.getint('max_variance_display', defaults['max_variance_display'])
                 defaults['skip_threshold'] = advanced_section.getint('skip_threshold', defaults['skip_threshold'])
+                defaults['ntp_samples'] = advanced_section.getint('ntp_samples', defaults['ntp_samples'])
 
             if 'email_settings' in config:
                 email_section = config['email_settings']
@@ -2274,7 +2335,8 @@ Default Behavior:
         parallel_limit=args.parallel_limit,
         ntp_timeout=args.timeout,
         verbose=args.verbose,
-        skip_threshold=args.skip_threshold
+        skip_threshold=args.skip_threshold,
+        ntp_samples=ini_config['ntp_samples']
     )
 
 
@@ -3223,7 +3285,8 @@ def main():
             parallel_limit=config.parallel_limit,
             ntp_timeout=config.ntp_timeout,
             verbose=config.verbose,
-            skip_threshold=config.skip_threshold
+            skip_threshold=config.skip_threshold,
+            ntp_samples=config.ntp_samples
         )
 
         # Parse NTP server list from file or auto-discover
