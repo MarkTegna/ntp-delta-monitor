@@ -14,7 +14,6 @@ import os
 import smtplib
 import socket
 import ssl
-import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,8 +29,10 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
 # Program version
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PROGRAM_NAME = "Certificate Expiry Monitor"
+__author__ = "Mark Oldham"
+__compile_date__ = "2026-09-29"
 
 
 @dataclass
@@ -100,7 +101,7 @@ def _parse_cert_expiry_from_der(der_bytes: bytes) -> Optional[str]:
             else:  # GeneralizedTime
                 return f"{int(time_str[:4]):04d}-{int(time_str[4:6]):02d}-{int(time_str[6:8]):02d}"
 
-        tag, cert_len, hdr = _read_tag_len(der_bytes, 0)
+        tag, _cert_len, hdr = _read_tag_len(der_bytes, 0)
         if tag != 0x30:
             return None
         tbs_offset = hdr
@@ -120,12 +121,12 @@ def _parse_cert_expiry_from_der(der_bytes: bytes) -> Optional[str]:
 
         if pos >= tbs_end:
             return None
-        tag, val_len, val_hdr = _read_tag_len(der_bytes, pos)
+        tag, _val_len, val_hdr = _read_tag_len(der_bytes, pos)
         if tag != 0x30:
             return None
 
         nb_offset = pos + val_hdr
-        nb_tag, nb_len, nb_hdr = _read_tag_len(der_bytes, nb_offset)
+        _nb_tag, nb_len, nb_hdr = _read_tag_len(der_bytes, nb_offset)
         na_offset = nb_offset + nb_hdr + nb_len
         return _parse_time(der_bytes, na_offset)
     except Exception:
@@ -150,7 +151,7 @@ def _extract_cert_field(der_bytes: bytes, field_index: int) -> Optional[str]:
             length = int.from_bytes(data[offset + 2:offset + 2 + num_bytes], 'big')
             return tag, length, 2 + num_bytes
 
-        tag, cert_len, hdr = _read_tag_len(der_bytes, 0)
+        tag, _cert_len, hdr = _read_tag_len(der_bytes, 0)
         if tag != 0x30:
             return None
         tbs_offset = hdr
@@ -302,11 +303,21 @@ def check_certificate(server: str, port: int = 443, timeout: int = 10,
             error_message=f'{e}')
 
 
-def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str]]:
+def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str, int, str]]:
     """
-    Parse CSV file with server list. Expects 'server' column, optional 'port' and 'short_name'.
+    Parse CSV file with server list. Expects 'server' column, optional 'port',
+    'short_name', 'failure_count', and 'alt_port'.
 
-    Returns list of (server, port, short_name) tuples.
+    'failure_count' is a persistent consecutive-failure counter: it is
+    incremented each run a server cannot be contacted / no cert retrieved,
+    and reset to 0 on a successful cert retrieval. 'alt_port' records the
+    alternate (fallback) port the server was actually reachable on when its
+    primary port failed; blank when the primary port worked or nothing did.
+    Missing/blank/invalid values default to 0 / '' (keeps older 1-3 column
+    CSVs backward compatible).
+
+    Returns list of (server, port, short_name, failure_count, alt_port) tuples.
+    'alt_port' is a string ('' when none).
     """
     logger = logging.getLogger(__name__)
     servers = []
@@ -320,6 +331,8 @@ def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str]]:
 
             has_port = 'port' in reader.fieldnames
             has_name = 'short_name' in reader.fieldnames
+            has_fail = 'failure_count' in reader.fieldnames
+            has_alt = 'alt_port' in reader.fieldnames
 
             for row_num, row in enumerate(reader, 2):
                 server = row.get('server', '').strip()
@@ -341,8 +354,22 @@ def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str]]:
                 if not short_name:
                     short_name = server
 
-                servers.append((server, port, short_name))
-                logger.debug(f"Row {row_num}: {server}:{port} ({short_name})")
+                failure_count = 0
+                if has_fail:
+                    fc_str = row.get('failure_count', '').strip()
+                    if fc_str:
+                        try:
+                            failure_count = max(int(fc_str), 0)
+                        except ValueError:
+                            failure_count = 0
+
+                alt_port = ''
+                if has_alt:
+                    alt_port = row.get('alt_port', '').strip()
+
+                servers.append((server, port, short_name, failure_count, alt_port))
+                logger.debug(f"Row {row_num}: {server}:{port} ({short_name}) "
+                             f"fail={failure_count} alt={alt_port or '-'}")
 
         logger.info(f"Parsed {len(servers)} servers from {file_path}")
         return servers
@@ -352,17 +379,56 @@ def parse_servers_csv(file_path: Path) -> List[tuple[str, int, str]]:
         sys.exit(1)
 
 
-def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config) -> tuple[List[CertResult], List[tuple[str, int, str]]]:
+def write_servers_csv(file_path: Path, rows: List[tuple[str, int, str, int, str]]) -> None:
     """
-    Process all servers concurrently. When port 443 fails, try all fallback ports.
-    Returns (results, new_entries) where new_entries are servers discovered on alternate ports.
+    Atomically rewrite the servers CSV with the failure_count and alt_port
+    columns.
+
+    Writes to a temporary '.tmp' file then replaces the original, so a
+    failure mid-write cannot corrupt the existing list. Non-fatal on error
+    (failure tracking is supplementary) - logs and leaves the original file
+    untouched.
+
+    Args:
+        file_path: Path to the servers CSV
+        rows: list of (server, port, short_name, failure_count, alt_port) tuples
+    """
+    logger = logging.getLogger(__name__)
+    temp_path = None
+    try:
+        temp_path = file_path.with_suffix(file_path.suffix + '.tmp')
+        with open(temp_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(['server', 'port', 'short_name', 'failure_count', 'alt_port'])
+            for server, port, short_name, failure_count, alt_port in rows:
+                writer.writerow([server, port, short_name, failure_count, alt_port])
+        temp_path.replace(file_path)
+        logger.info(f"Updated {file_path} with failure counts / alt ports ({len(rows)} rows)")
+    except Exception as e:
+        logger.error(f"Failed to write servers CSV {file_path}: {e}")
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
+
+def process_servers_parallel(servers: List[tuple[str, int, str, int, str]],
+                             config: Config) -> tuple[List[CertResult], dict]:
+    """
+    Process all servers concurrently. When the primary port fails, try all
+    fallback ports.
+
+    Returns (results, alt_ports) where alt_ports maps
+    (server, primary_port) -> working alternate port (int) for servers that
+    were unreachable on their primary port but succeeded on a fallback port.
     """
     logger = logging.getLogger(__name__)
     results = []
-    new_csv_entries = []  # (server, port, short_name) for servers found on alternate ports
+    alt_ports = {}  # (server, primary_port) -> alternate port that worked
 
     if not servers:
-        return results, new_csv_entries
+        return results, alt_ports
 
     max_workers = config.parallel_limit if config.parallel_limit > 0 else 10
     fallback_ports = config.fallback_ports or []
@@ -371,11 +437,11 @@ def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config
         logger.info(f"Fallback ports if 443 fails: {fallback_ports}")
 
     # Track which server+port combos are already in the CSV
-    existing_entries = {(s, p) for s, p, _ in servers}
+    existing_entries = {(s, p) for s, p, _, _, _ in servers}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_server = {}
-        for server, port, short_name in servers:
+        for server, port, short_name, _failure_count, _alt in servers:
             future = executor.submit(check_certificate, server, port, config.timeout, short_name)
             future_to_server[future] = (server, port, short_name)
 
@@ -406,18 +472,24 @@ def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config
                     if (result.server, alt_port) not in existing_entries:
                         future = executor.submit(check_certificate, result.server, alt_port,
                                                  config.timeout, result.short_name)
-                        fallback_futures[future] = (result.server, alt_port, result.short_name)
+                        # remember the primary (failed) port so we can annotate
+                        # the original CSV row with the working alternate port
+                        fallback_futures[future] = (result.server, alt_port,
+                                                     result.short_name, result.port)
 
             for future in as_completed(fallback_futures):
-                server, alt_port, short_name = fallback_futures[future]
+                server, alt_port, short_name, primary_port = fallback_futures[future]
                 try:
                     alt_result = future.result()
                     if alt_result.status == 'OK':
                         results.append(alt_result)
-                        if (server, alt_port) not in existing_entries:
-                            new_csv_entries.append((server, alt_port, short_name))
-                            existing_entries.add((server, alt_port))
-                            logger.info(f"Found cert on {server}:{alt_port} ({short_name})")
+                        # Record the working alternate port against the original
+                        # row. Keep the lowest working port if several succeed.
+                        key = (server, primary_port)
+                        if key not in alt_ports or alt_port < alt_ports[key]:
+                            alt_ports[key] = alt_port
+                        logger.info(f"Found cert on {server}:{alt_port} "
+                                    f"({short_name}) [primary {primary_port} failed]")
                 except Exception:
                     pass
 
@@ -430,7 +502,7 @@ def process_servers_parallel(servers: List[tuple[str, int, str]], config: Config
         return (2, 0)
 
     results.sort(key=sort_key)
-    return results, new_csv_entries
+    return results, alt_ports
 
 
 def _sanitize_xlsx(value: str) -> str:
@@ -528,7 +600,7 @@ def write_xlsx_report(results: List[CertResult], output_path: Path, config: Conf
                 try:
                     if hasattr(cell, 'column_letter') and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
-                except:
+                except (TypeError, AttributeError):
                     pass
             ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
 
@@ -610,7 +682,8 @@ def format_summary(results: List[CertResult], config: Config) -> str:
     failed = total - ok
     expired = sum(1 for r in results if r.days_remaining is not None and r.days_remaining <= 0)
     critical = sum(1 for r in results if r.days_remaining is not None and 0 < r.days_remaining <= config.critical_days)
-    warning = sum(1 for r in results if r.days_remaining is not None and config.critical_days < r.days_remaining <= config.warning_days)
+    warning = sum(1 for r in results if r.days_remaining is not None
+                  and config.critical_days < r.days_remaining <= config.warning_days)
 
     lines = [
         "=" * 60,
@@ -650,6 +723,201 @@ def format_summary(results: List[CertResult], config: Config) -> str:
     return "\n".join(lines)
 
 
+def _html_escape(text: str) -> str:
+    """Minimal HTML escaping for cell/text content."""
+    if text is None:
+        return ''
+    return (str(text)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+
+def build_email_body(results: List[CertResult], config: Config,
+                     ini_config: dict, source: str) -> tuple:
+    """
+    Build a structured summary email body grouped by severity.
+
+    'source' is a short attribution string shown at the bottom of the body
+    (e.g. the XLSX report filename).
+
+    Returns a tuple (plain_text, html) matching a report layout:
+      banner headline, source line, filter line, Summary block, and
+      grouped tables for Expired and Expiring Soon certificates.
+    """
+    # Window bounds: certificates from -low_days through +high_days
+    low_days = int(ini_config.get('email_low_days', 14))
+    high_days = int(ini_config.get('email_high_days', 21))
+
+    # Partition certs that have a known days_remaining within the window
+    in_window = [
+        r for r in results
+        if r.days_remaining is not None and -low_days <= r.days_remaining <= high_days
+    ]
+    expired = sorted(
+        [r for r in in_window if r.days_remaining <= 0],
+        key=lambda x: x.days_remaining
+    )
+    expiring = sorted(
+        [r for r in in_window if r.days_remaining > 0],
+        key=lambda x: x.days_remaining
+    )
+
+    matched = len(in_window)
+    n_expired = len(expired)
+    n_expiring = len(expiring)
+
+    # Headline banner reflects the most severe condition
+    if n_expired > 0:
+        banner_emoji = "🔴"
+        banner = (f"{banner_emoji} CRITICAL — {n_expired} "
+                  f"Certificate{'s' if n_expired != 1 else ''} Expired")
+        banner_detail = (f"{n_expired} certificate{'s' if n_expired != 1 else ''} "
+                         f"{'show' if n_expired != 1 else 'shows'} negative "
+                         f"Days Remaining. Immediate renewal action required.")
+    elif n_expiring > 0:
+        banner_emoji = "🟠"
+        banner = (f"{banner_emoji} WARNING — {n_expiring} "
+                  f"Certificate{'s' if n_expiring != 1 else ''} Expiring Soon")
+        banner_detail = (f"{n_expiring} certificate{'s' if n_expiring != 1 else ''} "
+                         f"expiring within {high_days} days. Plan renewal.")
+    else:
+        banner_emoji = "🟢"
+        banner = f"{banner_emoji} OK — No certificates in the alert window"
+        banner_detail = (f"No certificates fall within the -{low_days} to "
+                         f"+{high_days} day window.")
+
+    title = f"Certificate Expiry Report — Certs Within -{low_days} to +{high_days} Days"
+    source_line = f"Source: {source}"
+    filter_line = (f"Filter: Days Remaining between -{low_days} and +{high_days} "
+                   f"(inclusive)")
+
+    def _fmt_days(d: int) -> str:
+        return f"+{d}" if d > 0 else str(d)
+
+    # ---- Plain text version ----
+    pt = []
+    pt.append(banner)
+    pt.append(banner_detail)
+    pt.append("")
+    pt.append(title)
+    pt.append(source_line)
+    pt.append(filter_line)
+    pt.append("")
+    pt.append("Summary")
+    pt.append(f"  - {matched} certificate{'s' if matched != 1 else ''} matched "
+              f"the -{low_days} to +{high_days} day window")
+    pt.append(f"  - {n_expired} expired (Days Remaining: negative)")
+    pt.append(f"  - {n_expiring} expiring soon (Days Remaining: positive, "
+              f"within {high_days} days)")
+
+    if expired:
+        pt.append("")
+        pt.append(f"🔴 Expired Certificates ({n_expired})")
+        pt.append(f"  {'Server':<40} {'Shortname':<25} {'Days Remaining':>14}")
+        for r in expired:
+            pt.append(f"  {r.server:<40} {r.short_name:<25} "
+                      f"{_fmt_days(r.days_remaining):>14}")
+
+    if expiring:
+        pt.append("")
+        pt.append(f"🟠 Expiring Soon ({n_expiring})")
+        pt.append(f"  {'Server':<40} {'Shortname':<25} {'Days Remaining':>14}")
+        for r in expiring:
+            pt.append(f"  {r.server:<40} {r.short_name:<25} "
+                      f"{_fmt_days(r.days_remaining):>14}")
+
+    plain_text = "\n".join(pt)
+
+    # ---- HTML version ----
+    # Palette (per email format handoff):
+    #   Expired  -> header #d32f2f, border #c62828, alt row #fce4ec, text #d32f2f
+    #   Expiring -> header #e65100, border #bf360c, alt row #fff8e1, text #e65100
+    #   Summary box -> #4472C4 accent on #e8f0fe
+    #   Critical banner -> #d32f2f accent on #fdecea
+    #   All-clear -> #2e7d32
+    def _table(rows, header_bg, header_border, alt_row, cell_color):
+        head = (
+            '<table style="border-collapse:collapse;width:100%;margin-bottom:20px;">'
+            f'<tr style="background:{header_bg};color:white;">'
+            f'<th style="padding:8px 12px;text-align:left;border:1px solid {header_border};">Server</th>'
+            f'<th style="padding:8px 12px;text-align:left;border:1px solid {header_border};">Shortname</th>'
+            f'<th style="padding:8px 12px;text-align:center;border:1px solid {header_border};">Days Remaining</th>'
+            '</tr>'
+        )
+        body = ''
+        for i, r in enumerate(rows):
+            # Alternating row colors: even rows tinted, odd rows white
+            row_bg = alt_row if i % 2 == 0 else '#fff'
+            body += (
+                f'<tr style="background:{row_bg};">'
+                f'<td style="padding:6px 12px;border:1px solid #ddd;">{_html_escape(r.server)}</td>'
+                f'<td style="padding:6px 12px;border:1px solid #ddd;">{_html_escape(r.short_name)}</td>'
+                f'<td style="padding:6px 12px;text-align:center;border:1px solid #ddd;'
+                f'color:{cell_color};font-weight:bold;">{_fmt_days(r.days_remaining)}</td>'
+                '</tr>'
+            )
+        return head + body + '</table>'
+
+    html_parts = [
+        '<html><body style="font-family:Calibri,sans-serif;font-size:11pt;color:#333;">',
+    ]
+
+    # [1] Critical alert banner — only when there are expired certs
+    if n_expired > 0:
+        html_parts.append(
+            '<div style="border-left:4px solid #d32f2f;background:#fdecea;'
+            'padding:12px 16px;margin-bottom:16px;border-radius:4px;">'
+            '<strong style="color:#d32f2f;">&#9888;&#65039; CRITICAL:</strong> '
+            f'{n_expired} certificate{"s" if n_expired != 1 else ""} currently '
+            f'expired and {"require" if n_expired != 1 else "requires"} '
+            'immediate attention.'
+            '</div>'
+        )
+
+    # [2] Summary box — always present
+    html_parts.append(
+        '<div style="background:#e8f0fe;border-left:4px solid #4472C4;'
+        'padding:12px 16px;margin-bottom:20px;border-radius:4px;">'
+        f'<strong>Summary:</strong> {n_expired} expired, {n_expiring} expiring '
+        f'within {high_days} days ({matched} total actionable)'
+        '</div>'
+    )
+
+    # [3] Expired table — only if there are expired certs
+    if expired:
+        html_parts.append(
+            '<h3 style="color:#d32f2f;margin-bottom:8px;">'
+            '&#128308; Expired Certificates</h3>'
+        )
+        html_parts.append(_table(expired, '#d32f2f', '#c62828', '#fce4ec', '#d32f2f'))
+
+    # [4] Expiring soon table — only if there are expiring certs
+    if expiring:
+        html_parts.append(
+            '<h3 style="color:#e65100;margin-bottom:8px;">'
+            '&#128992; Expiring Soon</h3>'
+        )
+        html_parts.append(_table(expiring, '#e65100', '#bf360c', '#fff8e1', '#e65100'))
+
+    # [5] All-clear message — only if nothing is actionable
+    if not expired and not expiring:
+        html_parts.append(
+            '<p style="color:#2e7d32;">&#9989; No certificates in the critical '
+            f'window (-{low_days} to +{high_days} days).</p>'
+        )
+
+    # [6] Source attribution — always present
+    html_parts.append(
+        f'<p style="font-size:9pt;color:#888;">{_html_escape(source_line)}</p>'
+    )
+
+    html_parts.append('</body></html>')
+    html = "\n".join(html_parts)
+
+    return plain_text, html
+
+
 def send_email_notification(summary_text: str, xlsx_path: Path, results: List[CertResult],
                             config: Config, ini_config: dict) -> None:
     """Send email notification with results."""
@@ -660,24 +928,29 @@ def send_email_notification(summary_text: str, xlsx_path: Path, results: List[Ce
 
     try:
         expired = sum(1 for r in results if r.days_remaining is not None and r.days_remaining <= 0)
-        critical = sum(1 for r in results if r.days_remaining is not None and 0 < r.days_remaining <= config.critical_days)
+        critical = sum(1 for r in results if r.days_remaining is not None
+                       and 0 < r.days_remaining <= config.critical_days)
         failed = sum(1 for r in results if r.status != 'OK')
 
         has_error = expired > 0 or critical > 0 or failed > 0
-        prefix = "CERT ERROR" if has_error else "CERT REPORT"
 
-        issues = []
-        if expired > 0:
-            issues.append(f"{expired} expired")
-        if critical > 0:
-            issues.append(f"{critical} critical")
-        if failed > 0:
-            issues.append(f"{failed} unreachable")
+        # Subject uses the audience-facing wording based on the filtered
+        # -low..+high window counts (per email format handoff).
+        low_days = int(ini_config.get('email_low_days', 14))
+        high_days = int(ini_config.get('email_high_days', 21))
+        win_expired = sum(
+            1 for r in results
+            if r.days_remaining is not None and -low_days <= r.days_remaining <= 0
+        )
+        win_expiring = sum(
+            1 for r in results
+            if r.days_remaining is not None and 0 < r.days_remaining <= high_days
+        )
+        subject = (f"Certificate Expiry Alert - {win_expired} "
+                   f"Cert{'s' if win_expired != 1 else ''} Expired + "
+                   f"{win_expiring} Expiring Soon")
 
-        status_part = ', '.join(issues) if issues else "all certificates valid"
-        subject = f"{prefix} - {status_part}"
-
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('mixed')
         msg['From'] = ini_config.get('from_email', 'cert-monitor@tgna.tegna.com')
         msg['To'] = ini_config.get('to_email', 'moldham@tegna.com')
         msg['Subject'] = subject
@@ -687,7 +960,16 @@ def send_email_notification(summary_text: str, xlsx_path: Path, results: List[Ce
             msg['X-MSMail-Priority'] = 'High'
             msg['Importance'] = 'High'
 
-        msg.attach(MIMEText(summary_text, 'plain'))
+        # Build structured summary body (plain text + HTML alternatives).
+        # The alternative part is nested so attachments live at the
+        # top-level 'mixed' container. Source attribution references the
+        # XLSX report filename.
+        source = xlsx_path.name if xlsx_path else "cert_monitor report"
+        plain_body, html_body = build_email_body(results, config, ini_config, source)
+        body = MIMEMultipart('alternative')
+        body.attach(MIMEText(plain_body, 'plain', 'utf-8'))
+        body.attach(MIMEText(html_body, 'html', 'utf-8'))
+        msg.attach(body)
 
         if xlsx_path.exists():
             with open(xlsx_path, 'rb') as f:
@@ -735,6 +1017,10 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
         'smtp_password': '',
         'from_email': '',
         'to_email': '',
+        # Email summary window: certs with Days Remaining from
+        # -email_low_days through +email_high_days are listed in the body
+        'email_low_days': 14,
+        'email_high_days': 21,
     }
 
     config = configparser.ConfigParser()
@@ -745,7 +1031,8 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
 
             if 'monitor_settings' in config:
                 s = config['monitor_settings']
-                defaults['default_parallel_limit'] = s.getint('default_parallel_limit', defaults['default_parallel_limit'])
+                defaults['default_parallel_limit'] = s.getint(
+                    'default_parallel_limit', defaults['default_parallel_limit'])
                 defaults['default_timeout'] = s.getint('default_timeout', defaults['default_timeout'])
                 defaults['warning_days'] = s.getint('warning_days', defaults['warning_days'])
                 defaults['critical_days'] = s.getint('critical_days', defaults['critical_days'])
@@ -764,6 +1051,8 @@ def load_configuration(config_file: str = "cert_monitor.ini") -> dict:
                 defaults['smtp_password'] = s.get('smtp_password', defaults['smtp_password'])
                 defaults['from_email'] = s.get('from_email', defaults['from_email'])
                 defaults['to_email'] = s.get('to_email', defaults['to_email'])
+                defaults['email_low_days'] = s.getint('email_low_days', defaults['email_low_days'])
+                defaults['email_high_days'] = s.getint('email_high_days', defaults['email_high_days'])
         else:
             logger.debug(f"Config file {config_file} not found, using defaults")
     except Exception as e:
@@ -786,7 +1075,7 @@ def parse_arguments() -> Config:
     parser = argparse.ArgumentParser(
         description='Certificate Expiry Monitor - Check HTTPS certificate expiration dates',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
+        epilog="""
 Examples:
   Basic usage:
     %(prog)s -s servers.csv
@@ -875,18 +1164,58 @@ def main():
             return 1
 
         # Process servers
-        results, new_csv_entries = process_servers_parallel(servers, config)
+        results, alt_ports = process_servers_parallel(servers, config)
 
-        # Update CSV with newly discovered port entries
-        if new_csv_entries:
-            logger.info(f"Adding {len(new_csv_entries)} new entries to {config.servers_file}")
-            try:
-                with open(config.servers_file, 'a', newline='', encoding='utf-8') as f:
-                    for server, port, short_name in new_csv_entries:
-                        f.write(f'{server},{port},{short_name}\n')
-                logger.info(f"Updated {config.servers_file} with {len(new_csv_entries)} new port entries")
-            except Exception as e:
-                logger.error(f"Failed to update CSV: {e}")
+        # Update persistent failure_count / alt_port and rewrite the CSV.
+        # Rules (correlate to CSV rows strictly by (server, port)):
+        #   - Primary port returned a cert (OK): failure_count = 0, alt_port = ''
+        #   - Primary failed but reachable on a fallback port: failure_count += 1
+        #     (the primary port still failed) and alt_port = that working port
+        #   - Unreachable on primary and all fallbacks: failure_count += 1,
+        #     alt_port = ''
+        #   - No result at all for the row (unexpected): leave values unchanged
+        try:
+            # Best status per (server, port): 'OK' wins over any failure
+            status_by_key = {}
+            for r in results:
+                key = (r.server, r.port)
+                if r.status == 'OK':
+                    status_by_key[key] = 'OK'
+                elif key not in status_by_key:
+                    status_by_key[key] = r.status
+
+            updated_rows = []
+            for server, port, short_name, old_count, old_alt in servers:
+                status = status_by_key.get((server, port))
+                working_alt = alt_ports.get((server, port))
+
+                if status == 'OK':
+                    new_count = 0
+                    new_alt = ''
+                elif status is None:
+                    # No result for this row (unexpected) - leave values as-is
+                    new_count = old_count
+                    new_alt = old_alt
+                elif working_alt is not None:
+                    # Primary port failed; still count it as a failure even
+                    # though a cert was retrieved on a fallback port. Record
+                    # the working alternate port for reference.
+                    new_count = old_count + 1
+                    new_alt = str(working_alt)
+                    logger.info(f"{server}:{port} primary failed (reachable on "
+                                f"alt port {working_alt}) - failure_count "
+                                f"{old_count} -> {new_count}")
+                else:
+                    new_count = old_count + 1
+                    new_alt = ''
+                    logger.debug(f"{server}:{port} unreachable - failure_count "
+                                 f"{old_count} -> {new_count}")
+
+                updated_rows.append((server, port, short_name, new_count, new_alt))
+
+            write_servers_csv(config.servers_file, updated_rows)
+        except Exception as e:
+            logger.error(f"Failed to update failure counts in CSV: {e}")
 
         # Determine output path
         if config.output_file:

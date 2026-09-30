@@ -1,0 +1,31 @@
+# Pylint configuration for NTPChecker project
+# Correctness-relevant checks stay enabled. Pervasive stylistic conventions
+# and metric limits that would require large, risky refactors of working
+# code are disabled project-wide for consistency.
+
+[MAIN]
+# Allow common short names used throughout the project.
+good-names=i,j,k,e,f,r,s,p,d,ip,ok,ws,fc,na,nc
+
+[FORMAT]
+max-line-length=120
+
+[MESSAGES CONTROL]
+disable=
+    # Stylistic / metric limits on existing working code
+    too-many-lines,
+    too-many-instance-attributes,
+    too-many-locals,
+    too-many-branches,
+    too-many-statements,
+    too-many-arguments,
+    too-many-positional-arguments,
+    # Logging style preference (f-strings are used consistently here)
+    logging-fstring-interpolation,
+    # Broad exception handling is intentional for network/IO resilience
+    broad-exception-caught,
+    # Local imports are used to defer optional/heavy deps
+    import-outside-toplevel,
+    # Minor readability preferences
+    no-else-return,
+    unused-argument
